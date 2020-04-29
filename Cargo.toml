@@ -6,6 +6,10 @@ edition = "2018"
 license = "Apache-2.0"
 description = "Simple self growing / shrinking ThreadPool implementation based on crossbeam's multi-producer multi-consumer channels"
 repository = "https://github.com/robinfriedli/rusty_pool"
+homepage = "https://github.com/robinfriedli/rusty_pool"
+readme = "README.md"
+keywords = ["concurrency", "thread", "pool", "threadpool", "thread-pool"]
+categories = ["concurrency"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
