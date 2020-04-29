@@ -1,0 +1,12 @@
+[package]
+name = "rusty_pool"
+version = "0.1.0"
+authors = ["robinfriedli <robinfriedli@icloud.com>"]
+edition = "2018"
+license = "Apache-2.0"
+description = "Simple self growing / shrinking ThreadPool implementation based on crossbeam's multi-producer multi-consumer channels"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+crossbeam = "0.7.3"
