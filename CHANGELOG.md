@@ -14,9 +14,9 @@
       joining threads are notified. Because even if a thread would join exactly after the worker finished but before the idle worker count is incremented back to
       being equal to the total worker count it will get notified by the worker immediately after.
   * Improved Worker creation.
-    * The workers now receive the task they were created for through the green-light single consumer channel that previously just sent a bool. The `create_worker()`
-      function now returns a Result where the Err variant contains the submitted task in case the re-check fails and the new worker is abandoned in which case
-      the task will be sent to the main multi consumer channel instead.
+    * The workers now only spawn a thread once the re-check passes successfully, meaning the new worker is committed. The new worker is now started explicitly
+      when the re_check succeeds and receives it's first task via the `start()` function directly. The `create_worker()` function now returns a Result where
+      the Err variant contains the submitted task in case the re-check fails and the new worker is abandoned in which case the task will be sent to the main
+      multi consumer channel instead.
   * If the re-recheck fails when creating new core worker try creating a non-core thread instead.
-  * Don't spawn a thread when creating a worker until after the re-check succeeds.
   * Fix workers notifying joining threads when the channel is empty but there's still threads executing work.
