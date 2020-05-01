@@ -138,12 +138,45 @@ impl ThreadPool {
     /// If trying to create a new core worker failed the next step is to try creating a non-core worker instead.
     /// When all checks still fail the task will simply be sent to the main channel instead.
     ///
+    /// # Panics
+    ///
+    /// This function might panic if `try_execute` returns an error when either the crossbeam channel has been
+    /// closed unexpectedly or the `execute` function was somehow invoked after the `ThreadPool` was shut down.
+    /// Neither cases should occur under normal curcumstances using safe code, as shutting down the `ThreadPool`
+    /// consumes ownership and the crossbeam channel is never dropped unless dropping the `ThreadPool`.
+    pub fn execute<T: FnOnce() + Send + 'static>(&self, task: T) {
+        if let Err(exec_err) = self.try_execute(task) {
+            match exec_err {
+                ExecuteError::ChannelClosedError(_) => {
+                    panic!("the channel of the thread pool has been closed");
+                }
+                ExecuteError::ThreadPoolClosedError => {
+                    panic!("the thread pool has been shut down");
+                }
+            }
+        }
+    }
+
+    /// Send a new task to the worker threads. This function is responsible for sending the message through the
+    /// channel and creating new workers if needed. If the current worker count is lower than the core pool size
+    /// this function will always create a new worker. If the current worker count is equal to or greater than
+    /// the core pool size this function only creates a new worker if the worker count is below the max pool size
+    /// and there are no idle threads.
+    ///
+    /// After constructing the worker but before spawning its thread this function checks again whether the new
+    /// worker is still needed by analysing the old value returned by atomically incrementing the worker counter
+    /// and checking if the worker is still needed or if another thread has already created it,
+    /// for non-core threads this additionally checks whether there are idle threads now. When the recheck condition
+    /// still applies the new worker will receive the task directly as first task and start executing.
+    /// If trying to create a new core worker failed the next step is to try creating a non-core worker instead.
+    /// When all checks still fail the task will simply be sent to the main channel instead.
+    ///
     /// # Errors
     ///
     /// This function might return the `ChannelClosedError` variant of the `ExecuteError` enum
     /// if the sender was dropped unexpectedly (very unlikely) or the `ThreadPoolClosedError` variant
     /// if this function is somehow called after the `ThreadPool` has been shut down (extremely unlikely).
-    pub fn execute<T: FnOnce() + Send + 'static>(
+    pub fn try_execute<T: FnOnce() + Send + 'static>(
         &self,
         task: T,
     ) -> Result<(), ExecuteError<Box<dyn FnOnce() + Send + 'static>>> {
@@ -577,7 +610,6 @@ impl WorkerCountData {
     }
 }
 
-#[allow(unused_must_use)]
 #[cfg(test)]
 mod tests {
     use super::ThreadPool;

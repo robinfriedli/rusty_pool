@@ -1,3 +1,8 @@
+## [0.3.0] - 2020-05-01
+
+  * Removed `Result` from `ThreadPool::execute()` and added `ThreadPool::try_execute()` instead.
+    * Most often the user does not want to handle the result and prefers a panic in the very rare case the function returns an error (should not be possible with safe code).
+
 ## [0.2.0] - 2020-05-01
 
   * Added `shutdown_join()` and `shutdown_join_timeout(Duration)` to block the current thread until work in the pool is finished when shutting down the pool.
