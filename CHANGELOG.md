@@ -1,3 +1,7 @@
+## [0.3.1] - 2020-05-02
+
+  * No longer wrap crossbeam Receivers inside an Arc because they already can be cloned and sent to other threads.
+
 ## [0.3.0] - 2020-05-01
 
   * Removed `Result` from `ThreadPool::execute()` and added `ThreadPool::try_execute()` instead.

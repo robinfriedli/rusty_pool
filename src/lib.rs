@@ -60,7 +60,7 @@ pub struct ThreadPool {
     keep_alive: Duration,
     worker_count_data: Arc<WorkerCountData>,
     sender: channel::Sender<Task>,
-    receiver: Arc<channel::Receiver<Task>>,
+    receiver: channel::Receiver<Task>,
     join_notify_condvar: Arc<Condvar>,
     join_notify_mutex: Arc<Mutex<()>>,
 }
@@ -96,7 +96,7 @@ impl ThreadPool {
             keep_alive,
             worker_count_data: Arc::new(WorkerCountData::default()),
             sender,
-            receiver: Arc::new(receiver),
+            receiver: receiver,
             join_notify_condvar: Arc::new(Condvar::new()),
             join_notify_mutex: Arc::new(Mutex::new(())),
         }
@@ -298,7 +298,7 @@ impl ThreadPool {
         recheck_condition: T,
     ) -> Result<(), Task> {
         let worker = Worker::new(
-            Arc::clone(&self.receiver),
+            self.receiver.clone(),
             Arc::clone(&self.worker_count_data),
             !is_core,
             if is_core { None } else { Some(self.keep_alive) },
@@ -399,7 +399,7 @@ impl ThreadPool {
 }
 
 struct Worker {
-    receiver: Arc<channel::Receiver<Task>>,
+    receiver: channel::Receiver<Task>,
     worker_count_data: Arc<WorkerCountData>,
     can_timeout: bool,
     keep_alive: Option<Duration>,
@@ -409,7 +409,7 @@ struct Worker {
 
 impl Worker {
     fn new(
-        receiver: Arc<channel::Receiver<Task>>,
+        receiver: channel::Receiver<Task>,
         worker_count_data: Arc<WorkerCountData>,
         can_timeout: bool,
         keep_alive: Option<Duration>,
