@@ -16,7 +16,7 @@ type Task = Box<dyn FnOnce() + Send + 'static>;
 ///
 /// The ThreadPoolClosedError is returned if `execute()` is invoked after the pool has been
 /// shut down, which generally does not happen under normal circumstances since the
-/// `shutdown()` function cunsumes the value.
+/// `shutdown()` function consumes the value.
 pub enum ExecuteError<T> {
     ChannelClosedError(channel::SendError<T>),
     ThreadPoolClosedError,
@@ -27,7 +27,7 @@ pub enum ExecuteError<T> {
 ///
 /// This `ThreadPool` has two different pool sizes; a core pool size filled with
 /// threads that live for as long as the channel and a max pool size which describes
-/// the maximum amount of worker threads that may live at the sime time.
+/// the maximum amount of worker threads that may live at the same time.
 /// Those additional non-core threads have a specific keep_alive time described when
 /// creating the `ThreadPool` that defines how long such threads may be idle for
 /// without receiving any work before giving up and terminating their work loop.
@@ -38,15 +38,16 @@ pub enum ExecuteError<T> {
 /// current pool is lower than the max pool size and there are no idle threads.
 ///
 /// When creating a new worker this `ThreadPool` always re-checks whether the new worker
-/// is still required before spawing a thread and passing it the submitted task in case
+/// is still required before spawning a thread and passing it the submitted task in case
 /// an idle thread has opened up in the meantime or another thread has already created
 /// the worker. If the re-check failed for a core worker the pool will try creating a
-/// new non-core worker before deciding no new worker is needed.
+/// new non-core worker before deciding no new worker is needed. Panicking workers are
+/// always cloned and replaced.
 ///
 /// Locks are only used for the join functions to lock the `Condvar`, apart from that
 /// this `ThreadPool` implementation fully relies on crossbeam and atomic operations.
 /// This `ThreadPool` decides whether it is currently idle (and should fast-return
-/// join attemps) by comparing the total worker count to the idle worker count, which
+/// join attempts) by comparing the total worker count to the idle worker count, which
 /// are two `u32` values stored in one `AtomicU64` making sure that if both are updated
 /// they may be updated in a single atomic operation.
 ///
@@ -96,7 +97,7 @@ impl ThreadPool {
             keep_alive,
             worker_count_data: Arc::new(WorkerCountData::default()),
             sender,
-            receiver: receiver,
+            receiver,
             join_notify_condvar: Arc::new(Condvar::new()),
             join_notify_mutex: Arc::new(Mutex::new(())),
         }
@@ -142,7 +143,7 @@ impl ThreadPool {
     ///
     /// This function might panic if `try_execute` returns an error when either the crossbeam channel has been
     /// closed unexpectedly or the `execute` function was somehow invoked after the `ThreadPool` was shut down.
-    /// Neither cases should occur under normal curcumstances using safe code, as shutting down the `ThreadPool`
+    /// Neither cases should occur under normal circumstances using safe code, as shutting down the `ThreadPool`
     /// consumes ownership and the crossbeam channel is never dropped unless dropping the `ThreadPool`.
     pub fn execute<T: FnOnce() + Send + 'static>(&self, task: T) {
         if let Err(exec_err) = self.try_execute(task) {
@@ -209,10 +210,10 @@ impl ThreadPool {
     /// Blocks the current thread until there aren't any non-idle threads anymore.
     /// This includes work started after calling this function.
     /// This function blocks until the next time this `ThreadPool` completes all of its work,
-    /// except if all threads are idle at the time of calling this function, in which case
-    /// it will fast-return.
+    /// except if all threads are idle and the channel is empty at the time of calling this
+    /// function, in which case it will fast-return.
     ///
-    /// This utilizes a `Condvar` that is notified by workers when they coplete a job and notice
+    /// This utilizes a `Condvar` that is notified by workers when they complete a job and notice
     /// that the channel is currently empty and it was the last thread to finish the current
     /// generation of work (i.e. when incrementing the idle worker counter brings the value
     /// up to the total worker counter, meaning it's the last thread to become idle).
@@ -224,10 +225,10 @@ impl ThreadPool {
     /// specified time_out Duration passes, whichever happens first.
     /// This includes work started after calling this function.
     /// This function blocks until the next time this `ThreadPool` completes all of its work,
-    /// (or until the time_out is reached) except if all threads are idle at the time of calling
-    /// this function, in which case it will fast-return.
+    /// (or until the time_out is reached) except if all threads are idle and the channel is
+    /// empty at the time of calling this function, in which case it will fast-return.
     ///
-    /// This utilizes a `Condvar` that is notified by workers when they coplete a job and notice
+    /// This utilizes a `Condvar` that is notified by workers when they complete a job and notice
     /// that the channel is currently empty and it was the last thread to finish the current
     /// generation of work (i.e. when incrementing the idle worker counter brings the value
     /// up to the total worker counter, meaning it's the last thread to become idle).
@@ -255,10 +256,10 @@ impl ThreadPool {
     /// wait for all work to finish.
     /// Blocks the current thread until there aren't any non-idle threads anymore.
     /// This function blocks until this `ThreadPool` completes all of its work,
-    /// except if all threads are idle at the time of calling this function, in which case
-    /// the join will fast-return.
+    /// except if all threads are idle and the channel is empty at the time of
+    /// calling this function, in which case the join will fast-return.
     ///
-    /// The join utilizes a `Condvar` that is notified by workers when they coplete a job and notice
+    /// The join utilizes a `Condvar` that is notified by workers when they complete a job and notice
     /// that the channel is currently empty and it was the last thread to finish the current
     /// generation of work (i.e. when incrementing the idle worker counter brings the value
     /// up to the total worker counter, meaning it's the last thread to become idle).
@@ -277,10 +278,10 @@ impl ThreadPool {
     /// Blocks the current thread until there aren't any non-idle threads anymore or until the
     /// specified time_out Duration passes, whichever happens first.
     /// This function blocks until this `ThreadPool` completes all of its work,
-    /// (or until the time_out is reached) except if all threads are idle at the time of calling
-    /// this function, in which case the join will fast-return.
+    /// (or until the time_out is reached) except if all threads are idle and the channel is
+    /// empty at the time of calling this function, in which case the join will fast-return.
     ///
-    /// The join utilizes a `Condvar` that is notified by workers when they coplete a job and notice
+    /// The join utilizes a `Condvar` that is notified by workers when they complete a job and notice
     /// that the channel is currently empty and it was the last thread to finish the current
     /// generation of work (i.e. when incrementing the idle worker counter brings the value
     /// up to the total worker counter, meaning it's the last thread to become idle).
@@ -309,7 +310,7 @@ impl ThreadPool {
         let old_val = self.worker_count_data.increment_worker_total_ret_both();
         if recheck_condition(&self, old_val) {
             // new worker is still needed after checking again, give it the task and spawn the thread
-            worker.start(task);
+            worker.start(Some(task));
         } else {
             // recheck condition does not apply anymore, either there is an idle thread now (and is_core is false)
             // or the worker has already been created by another thread
@@ -342,9 +343,10 @@ impl ThreadPool {
     #[inline]
     fn inner_join(&self, time_out: Option<Duration>) {
         ThreadPool::_do_join(
-            self.worker_count_data.clone(),
-            self.join_notify_mutex.clone(),
-            self.join_notify_condvar.clone(),
+            &self.worker_count_data,
+            &self.join_notify_mutex,
+            &self.join_notify_condvar,
+            &self.receiver,
             time_out,
         );
     }
@@ -355,20 +357,28 @@ impl ThreadPool {
         let current_worker_count_data = self.worker_count_data.clone();
         let mutex = self.join_notify_mutex.clone();
         let condvar = self.join_notify_condvar.clone();
+        let receiver = self.receiver.clone();
         drop(self);
-        ThreadPool::_do_join(current_worker_count_data, mutex, condvar, timeout);
+        ThreadPool::_do_join(
+            &current_worker_count_data,
+            &mutex,
+            &condvar,
+            &receiver,
+            timeout,
+        );
     }
 
     #[inline]
     fn _do_join(
-        current_worker_count_data: Arc<WorkerCountData>,
-        join_notify_mutex: Arc<Mutex<()>>,
-        join_notify_condvar: Arc<Condvar>,
+        current_worker_count_data: &Arc<WorkerCountData>,
+        join_notify_mutex: &Arc<Mutex<()>>,
+        join_notify_condvar: &Arc<Condvar>,
+        receiver: &channel::Receiver<Task>,
         time_out: Option<Duration>,
     ) {
         let (current_worker_count, current_idle_count) = current_worker_count_data.get_both();
         // no thread is currently doing any work, return
-        if current_idle_count == current_worker_count {
+        if current_idle_count == current_worker_count && receiver.is_empty() {
             return;
         }
 
@@ -398,6 +408,7 @@ impl ThreadPool {
     }
 }
 
+#[derive(Clone)]
 struct Worker {
     receiver: channel::Receiver<Task>,
     worker_count_data: Arc<WorkerCountData>,
@@ -426,9 +437,13 @@ impl Worker {
         }
     }
 
-    fn start(self, task: Task) {
+    fn start(self, task: Option<Task>) {
         thread::spawn(move || {
-            self.exec_task_and_notify(task);
+            let mut sentinel = Sentinel::new(&self);
+
+            if let Some(task) = task {
+                self.exec_task_and_notify(&mut sentinel, task);
+            }
 
             loop {
                 // the two functions return different error types, but since the error type doesn't matter it is mapped to unit to make them compatible
@@ -447,7 +462,7 @@ impl Worker {
                     Ok(task) => {
                         // mark current as no longer idle and execute task
                         self.worker_count_data.decrement_worker_idle();
-                        self.exec_task_and_notify(task);
+                        self.exec_task_and_notify(&mut sentinel, task);
                     }
                     Err(_) => {
                         // either channel was broken because the sender disconnected or, if can_timeout is true, the Worker has not received any work during
@@ -456,6 +471,7 @@ impl Worker {
                     }
                 }
             }
+
             // can decrement both at once as the thread only gets here from an idle state
             // (if waiting for work and receiving an error)
             self.worker_count_data.decrement_both();
@@ -463,9 +479,16 @@ impl Worker {
     }
 
     #[inline]
-    fn exec_task_and_notify(&self, task: Task) {
+    fn exec_task_and_notify(&self, sentinel: &mut Sentinel, task: Task) {
+        sentinel.is_working = true;
         task();
+        sentinel.is_working = false;
         // can already mark as idle as this thread will continue the work loop
+        self.mark_idle_and_notify_joiners_if_no_work();
+    }
+
+    #[inline]
+    fn mark_idle_and_notify_joiners_if_no_work(&self) {
         let (old_total_count, old_idle_count) =
             self.worker_count_data.increment_worker_idle_ret_both();
         if self.receiver.is_empty() {
@@ -479,6 +502,45 @@ impl Worker {
                     .expect("could not get join notify mutex lock");
                 self.join_notify_condvar.notify_all();
             }
+        }
+    }
+}
+
+/// Type that exists to manage worker exit on panic.
+///
+/// This type is constructed once per `Worker` and implements `Drop` to handle proper worker exit
+/// in case the worker panics when executing the current task or anywhere else in its work loop.
+/// If the `Sentinel` is dropped at the end of the worker's work loop and the current thread is
+/// panicking, handle worker exit the same way as if the task completed normally (if the worker
+/// panicked while executing a submitted task) then clone the worker and start it with an initial
+/// task of `None`.
+struct Sentinel<'s> {
+    is_working: bool,
+    worker_ref: &'s Worker,
+}
+
+impl Sentinel<'_> {
+    fn new(worker_ref: &Worker) -> Sentinel<'_> {
+        Sentinel {
+            is_working: false,
+            worker_ref,
+        }
+    }
+}
+
+impl Drop for Sentinel<'_> {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            if self.is_working {
+                // worker thread panicked in the process of executing a submitted task,
+                // run the same logic as if the task completed normally and mark it as
+                // idle, since a clone of this task will start the work loop as idle
+                // thread
+                self.worker_ref.mark_idle_and_notify_joiners_if_no_work();
+            }
+
+            let worker = self.worker_ref.clone();
+            worker.start(None);
         }
     }
 }
@@ -1005,5 +1067,107 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 160);
         thread::sleep(Duration::from_secs(21));
         assert_eq!(pool.get_current_worker_count(), 3);
+    }
+
+    #[test]
+    fn test_panic_all() {
+        let pool = ThreadPool::new(3, 10, Duration::from_secs(2));
+
+        for _ in 0..10 {
+            pool.execute(|| {
+                panic!("test");
+            })
+        }
+
+        pool.join();
+        thread::sleep(Duration::from_secs(5));
+        assert_eq!(pool.get_current_worker_count(), 3);
+        assert_eq!(pool.get_idle_worker_count(), 3);
+    }
+
+    #[test]
+    fn test_panic_some() {
+        let pool = ThreadPool::new(3, 10, Duration::from_secs(5));
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        for i in 0..10 {
+            let clone = counter.clone();
+            pool.execute(move || {
+                if i < 3 || i % 2 == 0 {
+                    thread::sleep(Duration::from_secs(5));
+                    clone.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    thread::sleep(Duration::from_secs(5));
+                    panic!("test");
+                }
+            })
+        }
+
+        pool.join();
+        assert_eq!(counter.load(Ordering::SeqCst), 6);
+        assert_eq!(pool.get_current_worker_count(), 10);
+        assert_eq!(pool.get_idle_worker_count(), 10);
+        thread::sleep(Duration::from_secs(10));
+        assert_eq!(pool.get_current_worker_count(), 3);
+        assert_eq!(pool.get_idle_worker_count(), 3);
+    }
+
+    #[test]
+    fn test_panic_all_core_threads() {
+        let pool = ThreadPool::new(3, 3, Duration::from_secs(1));
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..3 {
+            pool.execute(|| {
+                panic!("test");
+            })
+        }
+
+        pool.join();
+
+        for i in 0..10 {
+            let clone = counter.clone();
+            pool.execute(move || {
+                if i < 3 || i % 2 == 0 {
+                    clone.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    thread::sleep(Duration::from_secs(5));
+                    panic!("test");
+                }
+            })
+        }
+
+        pool.join();
+        assert_eq!(counter.load(Ordering::SeqCst), 6);
+        assert_eq!(pool.get_current_worker_count(), 3);
+        assert_eq!(pool.get_idle_worker_count(), 3);
+    }
+
+    #[test]
+    fn test_drop_all_receivers() {
+        let pool = ThreadPool::new(0, 3, Duration::from_secs(5));
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..3 {
+            let clone = counter.clone();
+            pool.execute(move || {
+                clone.fetch_add(1, Ordering::SeqCst);
+            })
+        }
+
+        pool.join();
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+        thread::sleep(Duration::from_secs(10));
+        assert_eq!(pool.get_current_worker_count(), 0);
+
+        for _ in 0..3 {
+            let clone = counter.clone();
+            pool.execute(move || {
+                clone.fetch_add(1, Ordering::SeqCst);
+            })
+        }
+
+        pool.join();
+        assert_eq!(counter.load(Ordering::SeqCst), 6);
     }
 }

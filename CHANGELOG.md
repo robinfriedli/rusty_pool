@@ -1,3 +1,10 @@
+## [0.3.2] - 2020-05-03
+
+  * Add proper handling for panicking threads using a `Sentinel` that implements Drop and manages handling post-execution steps for workers that panicked while executing a
+    submitted task and clones and replaces the worker.
+  * Improve joins by also checking whether the `Receiver` is empty before fast-returning to eliminate a race condition where if a thread calls join in a brief window
+    between one worker finishing a task and the next worker beginning a task.
+
 ## [0.3.1] - 2020-05-02
 
   * No longer wrap crossbeam Receivers inside an Arc because they already can be cloned and sent to other threads.
