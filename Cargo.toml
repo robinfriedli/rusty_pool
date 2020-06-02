@@ -1,6 +1,6 @@
 [package]
 name = "rusty_pool"
-version = "0.3.2"
+version = "0.4.0"
 authors = ["robinfriedli <robinfriedli@icloud.com>"]
 edition = "2018"
 license = "Apache-2.0"
@@ -8,10 +8,19 @@ description = "Simple self growing / shrinking ThreadPool implementation based o
 repository = "https://github.com/robinfriedli/rusty_pool"
 homepage = "https://github.com/robinfriedli/rusty_pool"
 readme = "README.md"
-keywords = ["concurrency", "thread", "pool", "threadpool", "thread-pool"]
-categories = ["concurrency"]
+keywords = ["concurrency", "thread", "pool", "threadpool", "thread-pool", "async", "futures"]
+categories = ["asynchronous", "concurrency"]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = ["async"]
+async = ["futures"]
 
 [dependencies]
-crossbeam = "0.7.3"
+crossbeam-channel = "0.4.2"
+futures-channel = "0.3.5"
+futures-executor = "0.3.5"
+num_cpus = "1.13.0"
+
+[dependencies.futures]
+version = "0.3.5"
+optional = true

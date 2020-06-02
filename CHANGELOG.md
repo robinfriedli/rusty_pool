@@ -1,3 +1,32 @@
+## [0.4.0] - 2020-06-02
+
+  * Add async support
+    * Add "async" feature that enables using the rusty_pool as a fully featured futures executor that may poll features
+      and handle awakened futures.
+    * Add "complete" function to simply block a worker until a future is polled to completion.
+  * Add `JoinHandle` to enable awaiting a task's completion.
+    * The `JoinHandle` holds the receiving end of a oneshot channel that receives the result of the task or a cancellation
+      error if the task panics. The `await_complete()` and `try_await_complete()` functions can be used to block the calling
+      thread until the task has completed or failed. The `JoinHandle` may also be sent to the `ThreadPool` to create a task
+      that awaits the completion of the other task and then performs work using the result.
+  * Add Builder struct to create a new `ThreadPool` more conveniently.
+  * Name the `ThreadPool` and use the name as prefix for each worker thread's name.
+  * Create `Task` trait representing everything that can be executed by the `ThreadPool`.
+    * Add an implementation for any `FnOnce` closure that returns a thread-safe result
+    * Add an implementation for `AsyncTask` representing a future that may be polled and awakened if the "async" feature
+      is enabled.
+  * Implement `Default` for `ThreadPool`.
+  * Implement `Clone` for `ThreadPool`.
+    * All clones will use the same channel and the same worker pool, meaning shutting down and dropping one clone will
+      not cause the channel to break and other clones will still be intact. This also means that `shutdown_join()` will
+      behave the same as calling `join()` on a live `ThreadPool` while only dropping said clone, meaning tasks submitted
+      to other clones after `shutdown()` is called on this clone are joined as well.
+    * `AsyncTask` instances hold a clone of the `ThreadPool` they were created for used to re-submit themselves when
+      being awakened. This means the channel stays alive as long as there are pending `AsyncTask`s.
+  * Update readme and documentation and add doctests.
+  * Cleanup worker and channel data by putting them into separate structs.
+    * Only 2 Arcs needed now by wrapping the entire `ChannelData` and `WorkerData` structs into an Arc.
+
 ## [0.3.2] - 2020-05-03
 
   * Add proper handling for panicking threads using a `Sentinel` that implements Drop and manages handling post-execution steps for workers that panicked while executing a
