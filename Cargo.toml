@@ -8,7 +8,7 @@ description = "Simple self growing / shrinking ThreadPool implementation based o
 repository = "https://github.com/robinfriedli/rusty_pool"
 homepage = "https://github.com/robinfriedli/rusty_pool"
 readme = "README.md"
-keywords = ["concurrency", "thread", "pool", "threadpool", "thread-pool", "async", "futures"]
+keywords = ["concurrency", "thread", "threadpool", "async", "futures"]
 categories = ["asynchronous", "concurrency"]
 
 [features]
