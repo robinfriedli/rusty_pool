@@ -1,3 +1,13 @@
+## [0.4.1] - 2020-06-02
+
+  * Add `spawn_await()` and `try_spawn_await()` as an extension of `spawn()` that creates a new top-level future that awaits
+    the provided future and sends the result to a `JoinHandle`. This enables awaiting the final result outside of an async
+    context like `complete()` while still polling the future lazily instead of eagerly blocking the worker until the future
+    is done.
+  * Ignore dropped oneshot receiver for `try_evaluate()`.
+    * It is perfectly valid that the caller does not care about the result and drops the `JoinHandle` before
+      the result has been completed. In that case attempting to send the result should not panic.
+
 ## [0.4.0] - 2020-06-02
 
   * Add async support

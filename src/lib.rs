@@ -519,10 +519,8 @@ impl ThreadPool {
         let task = Box::new(task);
         let job = || {
             let result = task.run();
-            sender
-                .send(result)
-                .map_err(|_| ())
-                .expect("failed to send result to receiver");
+            // if the receiver was dropped that means the caller was not interested in the result
+            let _ignored_result = sender.send(result);
         };
 
         let execute_attempt = self.try_execute_task(Box::new(job));
@@ -532,6 +530,10 @@ impl ThreadPool {
     /// Send a task to the `ThreadPool` that completes the given `Future` and return a [`JoinHandle`](struct.JoinHandle.html)
     /// that may be used to await the result. This function simply calls [`evaluate()`](struct.ThreadPool.html#method.evaluate)
     /// with a closure that calls `block_on` with the provided future.
+    ///
+    /// # Panic
+    ///
+    /// This function panics if the task fails to be sent to the `ThreadPool` due to the channel being broken.
     pub fn complete<R: Send + Sync + 'static>(
         &self,
         future: impl Future<Output = R> + 'static + Send + Sync,
@@ -542,6 +544,10 @@ impl ThreadPool {
     /// Send a task to the `ThreadPool` that completes the given `Future` and return a [`JoinHandle`](struct.JoinHandle.html)
     /// that may be used to await the result. This function simply calls [`try_evaluate()`](struct.ThreadPool.html#method.try_evaluate)
     /// with a closure that calls `block_on` with the provided future.
+    ///
+    /// # Errors
+    ///
+    /// This function returns `crossbeam_channel::SendError` if the task fails to be sent to the `ThreadPool` due to the channel being broken.
     pub fn try_complete<R: Send + Sync + 'static>(
         &self,
         future: impl Future<Output = R> + 'static + Send + Sync,
@@ -553,6 +559,10 @@ impl ThreadPool {
     /// block a worker until the `Future` has been completed but polls the `Future` once at a time and creates a `Waker`
     /// that re-submits the Future to this pool when awakened. Since `Arc<AsyncTask>` implements the [`Task`](trait.Task.html) trait this
     /// function simply constructs the `AsyncTask` and calls [`execute()`](struct.ThreadPool.html#method.execute).
+    ///
+    /// # Panic
+    ///
+    /// This function panics if the task fails to be sent to the `ThreadPool` due to the channel being broken.
     #[cfg(feature = "async")]
     pub fn spawn(&self, future: impl Future<Output = ()> + 'static + Send) {
         let future_task = Arc::new(AsyncTask {
@@ -567,6 +577,10 @@ impl ThreadPool {
     /// block a worker until the `Future` has been completed but polls the `Future` once at a time and creates a `Waker`
     /// that re-submits the Future to this pool when awakened. Since `Arc<AsyncTask>` implements the [`Task`](trait.Task.html) trait this
     /// function simply constructs the `AsyncTask` and calls [`try_execute()`](struct.ThreadPool.html#method.try_execute).
+    ///
+    /// # Errors
+    ///
+    /// This function returns `crossbeam_channel::SendError` if the task fails to be sent to the `ThreadPool` due to the channel being broken.
     #[cfg(feature = "async")]
     pub fn try_spawn(
         &self,
@@ -578,6 +592,57 @@ impl ThreadPool {
         });
 
         self.try_execute(future_task)
+    }
+
+    /// Create a top-level `Future` that awaits the provided `Future` and then sends the result to the
+    /// returned [`JoinHandle`](struct.JoinHandle.html). Unlike [`complete()`](struct.ThreadPool.html#method.complete) this does not
+    /// block a worker until the `Future` has been completed but polls the `Future` once at a time and creates a `Waker`
+    /// that re-submits the Future to this pool when awakened. Since `Arc<AsyncTask>` implements the [`Task`](trait.Task.html) trait this
+    /// function simply constructs the `AsyncTask` and calls [`execute()`](struct.ThreadPool.html#method.execute).
+    ///
+    /// This enables awaiting the final result outside of an async context like [`complete()`](struct.ThreadPool.html#method.complete) while still
+    /// polling the future lazily instead of eagerly blocking the worker until the future is done.
+    ///
+    /// # Panic
+    ///
+    /// This function panics if the task fails to be sent to the `ThreadPool` due to the channel being broken.
+    #[cfg(feature = "async")]
+    pub fn spawn_await<R: Send + Sync + 'static>(
+        &self,
+        future: impl Future<Output = R> + 'static + Send,
+    ) -> JoinHandle<R> {
+        match self.try_spawn_await(future) {
+            Ok(handle) => handle,
+            Err(e) => panic!("the channel of the thread pool has been closed: {:?}", e),
+        }
+    }
+
+    /// Create a top-level `Future` that awaits the provided `Future` and then sends the result to the
+    /// returned [`JoinHandle`](struct.JoinHandle.html). Unlike [`try_complete()`](struct.ThreadPool.html#method.try_complete) this does not
+    /// block a worker until the `Future` has been completed but polls the `Future` once at a time and creates a `Waker`
+    /// that re-submits the Future to this pool when awakened. Since `Arc<AsyncTask>` implements the [`Task`](trait.Task.html) trait this
+    /// function simply constructs the `AsyncTask` and calls [`try_execute()`](struct.ThreadPool.html#method.try_execute).
+    ///
+    /// This enables awaiting the final result outside of an async context like [`complete()`](struct.ThreadPool.html#method.complete) while still
+    /// polling the future lazily instead of eagerly blocking the worker until the future is done.
+    ///
+    /// # Errors
+    ///
+    /// This function returns `crossbeam_channel::SendError` if the task fails to be sent to the `ThreadPool` due to the channel being broken.
+    #[cfg(feature = "async")]
+    pub fn try_spawn_await<R: Send + Sync + 'static>(
+        &self,
+        future: impl Future<Output = R> + 'static + Send,
+    ) -> Result<JoinHandle<R>, crossbeam_channel::SendError<Job>> {
+        let (sender, receiver) = oneshot::channel::<R>();
+        let join_handle = JoinHandle { receiver };
+
+        self.try_spawn(async {
+            let result = future.await;
+            // if the receiver was dropped that means the caller was not interested in the result
+            let _ignored_result = sender.send(result);
+        })
+        .map(|_| join_handle)
     }
 
     #[inline]
@@ -1787,5 +1852,44 @@ mod tests {
 
         pool.join();
         assert_eq!(count.load(Ordering::SeqCst), 29);
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn test_spawn_await() {
+        let pool = ThreadPool::default();
+
+        async fn sub(x: i32, y: i32) -> i32 {
+            x - y
+        }
+
+        async fn div(x: i32, y: i32) -> i32 {
+            x / y
+        }
+
+        let handle = pool.spawn_await(async {
+            let a = sub(120, 10).await; // 110
+            let b = div(sub(a, 10).await, 4).await; // 25
+            div(sub(b, div(10, 2).await).await, 5).await // 4
+        });
+
+        assert_eq!(handle.await_complete(), 4)
+    }
+
+    #[test]
+    fn test_drop_oneshot_receiver() {
+        let pool = Builder::new().core_size(1).max_size(1).build();
+
+        let handle = pool.evaluate(|| {
+            thread::sleep(Duration::from_secs(5));
+            5
+        });
+
+        drop(handle);
+        thread::sleep(Duration::from_secs(10));
+        let current_thread_index = pool.worker_data.worker_number.load(Ordering::SeqCst);
+        // current worker number of 2 means that one worker has started (initial number is 1 -> first worker gets and increments number)
+        // indicating that the worker did not panic else it would have been replaced.
+        assert_eq!(current_thread_index, 2);
     }
 }
