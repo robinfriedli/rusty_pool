@@ -1,3 +1,13 @@
+## [0.4.2] - 2020-06-30
+
+  * Builder: make sure core size is lower or equal to max size if max size was specified explicitly but core size wasn't.
+    * build() panicked if max size was specified to be lower than default core size.
+    * Set the core size to the specified max size if lower than the number of CPUs.
+    * Handle possible u32 overflow when calculating default max size based on core size.
+  * Remove unneeded `Sync` trait bounds.
+  * Remove unneeded boxing.
+  * Add additional tests.
+
 ## [0.4.1] - 2020-06-02
 
   * Add `spawn_await()` and `try_spawn_await()` as an extension of `spawn()` that creates a new top-level future that awaits

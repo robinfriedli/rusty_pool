@@ -19,7 +19,7 @@ use std::time::Duration;
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
 /// Trait to implement for all items that may be executed by the `ThreadPool`.
-pub trait Task<R: Send + Sync>: Send + Sync {
+pub trait Task<R: Send>: Send {
     /// Execute this task and return its result.
     fn run(self) -> R;
 
@@ -36,8 +36,8 @@ pub trait Task<R: Send + Sync>: Send + Sync {
 /// Implement the `Task` trait for any FnOnce closure that returns a thread-safe result.
 impl<R, F> Task<R> for F
 where
-    R: Send + Sync,
-    F: FnOnce() -> R + Send + Sync + 'static,
+    R: Send,
+    F: FnOnce() -> R + Send + 'static,
 {
     fn run(self) -> R {
         self()
@@ -57,11 +57,11 @@ where
 /// to create a task that blocks a worker thread until the task is completed and then does something with the result. This handle communicates with the worker thread
 /// using a oneshot channel blocking the thread when [`try_await_complete()`](struct.JoinHandle.html#method.try_await_complete) is called until a message, i.e. the result of the
 /// task, is received.
-pub struct JoinHandle<T: Send + Sync> {
+pub struct JoinHandle<T: Send> {
     receiver: oneshot::Receiver<T>,
 }
 
-impl<T: Send + Sync> JoinHandle<T> {
+impl<T: Send> JoinHandle<T> {
     /// Block the current thread until the result of the task is received.
     ///
     /// # Errors
@@ -127,12 +127,12 @@ impl Task<()> for Arc<AsyncTask> {
     }
 }
 
-// assert that Send + Sync is implemented
-trait ThreadSafe: Send + Sync {}
+// assert that Send is implemented
+trait ThreadSafe: Send {}
 
-impl<R: Send + Sync> ThreadSafe for dyn Task<R> {}
+impl<R: Send> ThreadSafe for dyn Task<R> {}
 
-impl<R: Send + Sync> ThreadSafe for JoinHandle<R> {}
+impl<R: Send> ThreadSafe for JoinHandle<R> {}
 
 impl ThreadSafe for ThreadPool {}
 
@@ -447,9 +447,7 @@ impl ThreadPool {
         &self,
         task: T,
     ) -> Result<(), crossbeam_channel::SendError<Job>> {
-        let is_fn = task.is_fn();
-        let task = Box::new(task);
-        if is_fn {
+        if task.is_fn() {
             self.try_execute_task(
                 task.as_fn()
                     .expect("Task::as_fn returned None despite is_fn returning true"),
@@ -482,10 +480,7 @@ impl ThreadPool {
     /// closed unexpectedly.
     /// This should never occur under normal circumstances using safe code, as shutting down the `ThreadPool`
     /// consumes ownership and the crossbeam channel is never dropped unless dropping the `ThreadPool`.
-    pub fn evaluate<R: Send + Sync + 'static, T: Task<R> + 'static>(
-        &self,
-        task: T,
-    ) -> JoinHandle<R> {
+    pub fn evaluate<R: Send + 'static, T: Task<R> + 'static>(&self, task: T) -> JoinHandle<R> {
         match self.try_evaluate(task) {
             Ok(handle) => handle,
             Err(e) => panic!("the channel of the thread pool has been closed: {:?}", e),
@@ -510,13 +505,12 @@ impl ThreadPool {
     /// # Errors
     ///
     /// This function might return `crossbeam_channel::SendError` if the sender was dropped unexpectedly.
-    pub fn try_evaluate<R: Send + Sync + 'static, T: Task<R> + 'static>(
+    pub fn try_evaluate<R: Send + 'static, T: Task<R> + 'static>(
         &self,
         task: T,
     ) -> Result<JoinHandle<R>, crossbeam_channel::SendError<Job>> {
         let (sender, receiver) = oneshot::channel::<R>();
         let join_handle = JoinHandle { receiver };
-        let task = Box::new(task);
         let job = || {
             let result = task.run();
             // if the receiver was dropped that means the caller was not interested in the result
@@ -534,9 +528,9 @@ impl ThreadPool {
     /// # Panic
     ///
     /// This function panics if the task fails to be sent to the `ThreadPool` due to the channel being broken.
-    pub fn complete<R: Send + Sync + 'static>(
+    pub fn complete<R: Send + 'static>(
         &self,
-        future: impl Future<Output = R> + 'static + Send + Sync,
+        future: impl Future<Output = R> + 'static + Send,
     ) -> JoinHandle<R> {
         self.evaluate(|| block_on(future))
     }
@@ -548,9 +542,9 @@ impl ThreadPool {
     /// # Errors
     ///
     /// This function returns `crossbeam_channel::SendError` if the task fails to be sent to the `ThreadPool` due to the channel being broken.
-    pub fn try_complete<R: Send + Sync + 'static>(
+    pub fn try_complete<R: Send + 'static>(
         &self,
-        future: impl Future<Output = R> + 'static + Send + Sync,
+        future: impl Future<Output = R> + 'static + Send,
     ) -> Result<JoinHandle<R>, crossbeam_channel::SendError<Job>> {
         self.try_evaluate(|| block_on(future))
     }
@@ -607,7 +601,7 @@ impl ThreadPool {
     ///
     /// This function panics if the task fails to be sent to the `ThreadPool` due to the channel being broken.
     #[cfg(feature = "async")]
-    pub fn spawn_await<R: Send + Sync + 'static>(
+    pub fn spawn_await<R: Send + 'static>(
         &self,
         future: impl Future<Output = R> + 'static + Send,
     ) -> JoinHandle<R> {
@@ -630,7 +624,7 @@ impl ThreadPool {
     ///
     /// This function returns `crossbeam_channel::SendError` if the task fails to be sent to the `ThreadPool` due to the channel being broken.
     #[cfg(feature = "async")]
-    pub fn try_spawn_await<R: Send + Sync + 'static>(
+    pub fn try_spawn_await<R: Send + 'static>(
         &self,
         future: impl Future<Output = R> + 'static + Send,
     ) -> Result<JoinHandle<R>, crossbeam_channel::SendError<Job>> {
@@ -939,8 +933,33 @@ impl Builder {
     ///
     /// Building might panic if the `max_size` is 0 or lower than `core_size`:
     pub fn build(self) -> ThreadPool {
-        let core_size = self.core_size.unwrap_or(num_cpus::get() as u32);
-        let max_size = self.max_size.unwrap_or(core_size * 4);
+        let core_size = self.core_size.unwrap_or_else(|| {
+            let num_cpus = num_cpus::get() as u32;
+            if let Some(max_size) = self.max_size {
+                if num_cpus <= max_size {
+                    num_cpus
+                } else {
+                    max_size
+                }
+            } else {
+                num_cpus
+            }
+        });
+        // handle potential u32 overflow: try using twice or four times the core_size or return the
+        // first result that did not overflow
+        let max_size = self.max_size.unwrap_or_else(|| {
+            let times_two = core_size * 2;
+            if times_two < core_size {
+                core_size
+            } else {
+                let times_four = core_size * 4;
+                if times_four < core_size {
+                    times_two
+                } else {
+                    times_four
+                }
+            }
+        });
         let keep_alive = self.keep_alive.unwrap_or(Duration::from_secs(60));
 
         if let Some(name) = self.name {
@@ -1891,5 +1910,62 @@ mod tests {
         // current worker number of 2 means that one worker has started (initial number is 1 -> first worker gets and increments number)
         // indicating that the worker did not panic else it would have been replaced.
         assert_eq!(current_thread_index, 2);
+    }
+
+    #[test]
+    fn test_builder_max_size() {
+        Builder::new().max_size(1).build();
+    }
+
+    #[test]
+    fn test_multi_thread_join() {
+        let pool = ThreadPool::default();
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let clone1 = count.clone();
+        pool.execute(move || {
+            thread::sleep(Duration::from_secs(10));
+            clone1.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let clone2 = count.clone();
+        pool.execute(move || {
+            thread::sleep(Duration::from_secs(10));
+            clone2.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let clone3 = count.clone();
+        pool.execute(move || {
+            thread::sleep(Duration::from_secs(10));
+            clone3.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let pool2 = pool.clone();
+        let clone4 = count.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(5));
+            pool2.execute(move || {
+                thread::sleep(Duration::from_secs(15));
+                clone4.fetch_add(2, Ordering::SeqCst);
+            });
+        });
+
+        let pool3 = pool.clone();
+        let pool4 = pool.clone();
+        let pool5 = pool.clone();
+        let h1 = thread::spawn(move || {
+            pool3.join();
+        });
+        let h2 = thread::spawn(move || {
+            pool4.join();
+        });
+        let h3 = thread::spawn(move || {
+            pool5.join();
+        });
+        h1.join().unwrap();
+        h2.join().unwrap();
+        h3.join().unwrap();
+
+        assert_eq!(count.load(Ordering::SeqCst), 5);
     }
 }
