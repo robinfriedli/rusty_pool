@@ -1401,6 +1401,8 @@ mod tests {
 
         pool.join_timeout(Duration::from_secs(5));
         assert_eq!(counter.load(Ordering::SeqCst), 0);
+        pool.join();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1454,7 +1456,7 @@ mod tests {
     )]
     #[test]
     fn test_panic_on_smaller_max_than_core_pool_size() {
-        ThreadPool::new(0, 0, Duration::from_secs(2));
+        ThreadPool::new(10, 4, Duration::from_secs(2));
     }
 
     #[test]
@@ -1527,6 +1529,53 @@ mod tests {
     fn test_empty_shutdown_join() {
         let pool = ThreadPool::new(1, 5, Duration::from_secs(5));
         pool.shutdown_join();
+    }
+
+    #[test]
+    fn test_shutdown_core_pool() {
+        let pool = ThreadPool::new(5, 5, Duration::from_secs(1));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let worker_data = pool.worker_data.clone();
+
+        for _ in 0..7 {
+            let clone = counter.clone();
+            pool.execute(move || {
+                thread::sleep(Duration::from_secs(2));
+                clone.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+
+        assert_eq!(pool.get_current_worker_count(), 5);
+        assert_eq!(pool.get_idle_worker_count(), 0);
+        pool.shutdown_join();
+        assert_eq!(counter.load(Ordering::SeqCst), 7);
+
+        // give the workers time to exit
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(worker_data.worker_count_data.get_total_worker_count(), 0);
+        assert_eq!(worker_data.worker_count_data.get_idle_worker_count(), 0);
+    }
+
+    #[test]
+    fn test_shutdown_idle_core_pool() {
+        let pool = ThreadPool::new(5, 5, Duration::from_secs(1));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let worker_data = pool.worker_data.clone();
+
+        for _ in 0..5 {
+            let clone = counter.clone();
+            pool.execute(move || {
+                clone.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+
+        pool.shutdown_join();
+        assert_eq!(counter.load(Ordering::SeqCst), 5);
+
+        // give the workers time to exit
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(worker_data.worker_count_data.get_total_worker_count(), 0);
+        assert_eq!(worker_data.worker_count_data.get_idle_worker_count(), 0);
     }
 
     #[test]
@@ -1793,19 +1842,15 @@ mod tests {
 
         let handle_2 = pool.evaluate(move || {
             let result = handle_1.await_complete();
-            let count = AtomicUsize::new(result);
+            let mut count = result;
 
-            for _ in 0..15000 {
-                count.fetch_add(1, Ordering::SeqCst);
-            }
+            count += 15000;
 
             thread::sleep(Duration::from_secs(5));
 
-            for _ in 0..20000 {
-                count.fetch_add(1, Ordering::SeqCst);
-            }
+            count += 20000;
 
-            count.load(Ordering::SeqCst)
+            count
         });
 
         let result = handle_2.await_complete();
