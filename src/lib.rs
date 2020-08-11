@@ -833,10 +833,8 @@ impl ThreadPool {
         receiver: &crossbeam_channel::Receiver<Job>,
         time_out: Option<Duration>,
     ) {
-        let (current_worker_count, current_idle_count) =
-            current_worker_data.worker_count_data.get_both();
         // no thread is currently doing any work, return
-        if current_idle_count == current_worker_count && receiver.is_empty() {
+        if ThreadPool::is_idle(&current_worker_data, &receiver) {
             return;
         }
 
@@ -844,6 +842,11 @@ impl ThreadPool {
             .join_notify_mutex
             .lock()
             .expect("could not get join notify mutex lock");
+
+        // recheck after acquiring lock
+        if ThreadPool::is_idle(&current_worker_data, &receiver) {
+            return;
+        }
 
         match time_out {
             Some(time_out) => {
@@ -864,6 +867,16 @@ impl ThreadPool {
     fn recheck_non_core(&self, old_val: (u32, u32)) -> bool {
         let (old_worker_total, old_worker_idle) = old_val;
         old_worker_total < self.max_size && old_worker_idle == 0
+    }
+
+    #[inline]
+    fn is_idle(
+        current_worker_data: &Arc<WorkerData>,
+        receiver: &crossbeam_channel::Receiver<Job>,
+    ) -> bool {
+        let (current_worker_count, current_idle_count) =
+            current_worker_data.worker_count_data.get_both();
+        current_idle_count == current_worker_count && receiver.is_empty()
     }
 }
 

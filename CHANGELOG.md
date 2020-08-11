@@ -1,3 +1,7 @@
+## [0.4.3] - 2020-08-11
+
+  * _do_join(): recheck whether the pool has become idle after acquiring the lock
+
 ## [0.4.2] - 2020-06-30
 
   * Builder: make sure core size is lower or equal to max size if max size was specified explicitly but core size wasn't.

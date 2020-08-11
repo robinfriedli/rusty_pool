@@ -170,12 +170,12 @@ assert_eq!(count.load(Ordering::SeqCst), 15);
 To add rusty_pool to your project simply add the following Cargo dependency:
 ```toml
 [dependencies]
-rusty_pool = "0.4.2"
+rusty_pool = "0.4.3"
 ```
 
 Or to exclude the "async" feature:
 ```toml
 [dependencies.rusty_pool]
-version = "0.4.2"
+version = "0.4.3"
 default-features = false
 ```
