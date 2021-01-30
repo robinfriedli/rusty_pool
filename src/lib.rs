@@ -175,12 +175,13 @@ impl ThreadSafe for ThreadPool {}
 /// version = "*"
 /// ```
 ///
-/// When creating a new worker this `ThreadPool` always re-checks whether the new worker
-/// is still required before spawning a thread and passing it the submitted task in case
-/// an idle thread has opened up in the meantime or another thread has already created
-/// the worker. If the re-check failed for a core worker the pool will try creating a
-/// new non-core worker before deciding no new worker is needed. Panicking workers are
-/// always cloned and replaced.
+/// When creating a new worker this `ThreadPool` tries to increment the worker count
+/// using a compare-and-swap mechanism, if the increment fails because the total worker
+/// count has been incremented to the specified limit (the core_size when trying to
+/// create a core thread, else the max_size) by another thread, the pool tries to create
+/// a non-core worker instead (if previously trying to create a core worker and no idle
+/// worker exists) or sends the task to the channel instead. Panicking workers are always
+/// cloned and replaced.
 ///
 /// Locks are only used for the join functions to lock the `Condvar`, apart from that
 /// this `ThreadPool` implementation fully relies on crossbeam and atomic operations.
@@ -192,6 +193,8 @@ impl ThreadSafe for ThreadPool {}
 /// The thread pool and its crossbeam channel can be destroyed by using the shutdown
 /// function, however that does not stop tasks that are already running but will
 /// terminate the thread the next time it will try to fetch work from the channel.
+/// The channel is only destroyed once all clones of the `ThreadPool` have been
+/// shut down / dropped.
 ///
 /// # Usage
 /// Create a new `ThreadPool`:
@@ -266,10 +269,10 @@ impl ThreadSafe for ThreadPool {}
 ///     let a = some_async_fn(3, 6).await; // 9
 ///     let b = other_async_fn(a, 4).await; // 5
 ///     let c = some_async_fn(b, 7).await; // 12
-///     clone.fetch_add(c, Ordering::SeqCst);
+///     clone.fetch_add(c, Ordering::Relaxed);
 /// });
 /// pool.join();
-/// assert_eq!(count.load(Ordering::SeqCst), 12);
+/// assert_eq!(count.load(Ordering::Relaxed), 12);
 /// ```
 ///
 /// Join and shut down the `ThreadPool`:
@@ -291,14 +294,14 @@ impl ThreadSafe for ThreadPool {}
 ///     let clone = count.clone();
 ///     pool.execute(move || {
 ///         thread::sleep(Duration::from_secs(5));
-///         clone.fetch_add(1, Ordering::SeqCst);
+///         clone.fetch_add(1, Ordering::Relaxed);
 ///     });
 /// }
 ///
 /// // shut down and drop the only instance of this `ThreadPool` (no clones) causing the channel to be broken leading all workers to exit after completing their current work
 /// // and wait for all workers to become idle, i.e. finish their work.
 /// pool.shutdown_join();
-/// assert_eq!(count.load(Ordering::SeqCst), 15);
+/// assert_eq!(count.load(Ordering::Relaxed), 15);
 /// ```
 #[derive(Clone)]
 pub struct ThreadPool {
@@ -329,7 +332,10 @@ impl ThreadPool {
     /// This function will panic if max_size is 0 or lower than core_size.
     pub fn new(core_size: u32, max_size: u32, keep_alive: Duration) -> Self {
         static POOL_COUNTER: AtomicUsize = AtomicUsize::new(1);
-        let name = format!("rusty_pool_{}", POOL_COUNTER.fetch_add(1, Ordering::SeqCst));
+        let name = format!(
+            "rusty_pool_{}",
+            POOL_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
         ThreadPool::new_named(name, core_size, max_size, keep_alive)
     }
 
@@ -380,12 +386,13 @@ impl ThreadPool {
 
     /// Get the number of live workers, includes all workers waiting for work or executing tasks.
     ///
-    /// This counter is incremented when creating a new worker even before re-checking whether
-    /// the worker is still needed. Once the worker count is updated the previous value returned
-    /// by the atomic operation is analysed to check whether it still represents a value that
-    /// would require a new worker. If that is not the case this counter will be decremented
-    /// and the worker will never spawn a thread and start its working loop. Else this counter
-    /// is decremented when a worker reaches the end of its working loop, which for non-core
+    /// This counter is incremented when creating a new worker. The value is increment just before
+    /// the worker starts executing its initial task. Incrementing the worker total might fail
+    /// if the total has already reached the specified limit (either core_size or max_size) after
+    /// being incremented by another thread, as of rusty_pool 0.5.0 failed attempts to create a worker
+    /// no longer skews the worker total as failed attempts to increment the worker total does not
+    /// increment the value at all.
+    /// This counter is decremented when a worker reaches the end of its working loop, which for non-core
     /// threads might happen if it does not receive any work during its keep alive time,
     /// for core threads this only happens once the channel is disconnected.
     pub fn get_current_worker_count(&self) -> u32 {
@@ -406,13 +413,14 @@ impl ThreadPool {
     /// the core pool size this function only creates a new worker if the worker count is below the max pool size
     /// and there are no idle threads.
     ///
-    /// After constructing the worker but before spawning its thread this function checks again whether the new
-    /// worker is still needed by analysing the old value returned by atomically incrementing the worker counter
-    /// and checking if the worker is still needed or if another thread has already created it,
-    /// for non-core threads this additionally checks whether there are idle threads now. When the recheck condition
-    /// still applies the new worker will receive the task directly as first task and start executing.
-    /// If trying to create a new core worker failed the next step is to try creating a non-core worker instead.
-    /// When all checks still fail the task will simply be sent to the main channel instead.
+    /// When attempting to increment the total worker count before creating a worker fails due to the
+    /// counter reaching the provided limit (core_size when attempting to create core thread, else
+    /// max_size) after being incremented by another thread, the pool tries to create
+    /// a non-core worker instead (if previously trying to create a core worker and no idle
+    /// worker exists) or sends the task to the channel instead. If incrementing the counter succeeded,
+    /// either because the current value of the counter matched the expected value or because the
+    /// last observed value was still below the limit, the worker starts with the provided task as
+    /// initial task and spawns its thread.
     ///
     /// # Panics
     ///
@@ -432,13 +440,14 @@ impl ThreadPool {
     /// the core pool size this function only creates a new worker if the worker count is below the max pool size
     /// and there are no idle threads.
     ///
-    /// After constructing the worker but before spawning its thread this function checks again whether the new
-    /// worker is still needed by analysing the old value returned by atomically incrementing the worker counter
-    /// and checking if the worker is still needed or if another thread has already created it,
-    /// for non-core threads this additionally checks whether there are idle threads now. When the recheck condition
-    /// still applies the new worker will receive the task directly as first task and start executing.
-    /// If trying to create a new core worker failed the next step is to try creating a non-core worker instead.
-    /// When all checks still fail the task will simply be sent to the main channel instead.
+    /// When attempting to increment the total worker count before creating a worker fails due to the
+    /// counter reaching the provided limit (core_size when attempting to create core thread, else
+    /// max_size) after being incremented by another thread, the pool tries to create
+    /// a non-core worker instead (if previously trying to create a core worker and no idle
+    /// worker exists) or sends the task to the channel instead. If incrementing the counter succeeded,
+    /// either because the current value of the counter matched the expected value or because the
+    /// last observed value was still below the limit, the worker starts with the provided task as
+    /// initial task and spawns its thread.
     ///
     /// # Errors
     ///
@@ -466,13 +475,14 @@ impl ThreadPool {
     /// function only creates a new worker if the worker count is below the max pool size and there are no idle
     /// threads.
     ///
-    /// After constructing the worker but before spawning its thread this function checks again whether the new
-    /// worker is still needed by analysing the old value returned by atomically incrementing the worker counter
-    /// and checking if the worker is still needed or if another thread has already created it,
-    /// for non-core threads this additionally checks whether there are idle threads now. When the recheck condition
-    /// still applies the new worker will receive the task directly as first task and start executing.
-    /// If trying to create a new core worker failed the next step is to try creating a non-core worker instead.
-    /// When all checks still fail the task will simply be sent to the main channel instead.
+    /// When attempting to increment the total worker count before creating a worker fails due to the
+    /// counter reaching the provided limit (core_size when attempting to create core thread, else
+    /// max_size) after being incremented by another thread, the pool tries to create
+    /// a non-core worker instead (if previously trying to create a core worker and no idle
+    /// worker exists) or sends the task to the channel instead. If incrementing the counter succeeded,
+    /// either because the current value of the counter matched the expected value or because the
+    /// last observed value was still below the limit, the worker starts with the provided task as
+    /// initial task and spawns its thread.
     ///
     /// # Panics
     ///
@@ -494,13 +504,14 @@ impl ThreadPool {
     /// function only creates a new worker if the worker count is below the max pool size and there are no idle
     /// threads.
     ///
-    /// After constructing the worker but before spawning its thread this function checks again whether the new
-    /// worker is still needed by analysing the old value returned by atomically incrementing the worker counter
-    /// and checking if the worker is still needed or if another thread has already created it,
-    /// for non-core threads this additionally checks whether there are idle threads now. When the recheck condition
-    /// still applies the new worker will receive the task directly as first task and start executing.
-    /// If trying to create a new core worker failed the next step is to try creating a non-core worker instead.
-    /// When all checks still fail the task will simply be sent to the main channel instead.
+    /// When attempting to increment the total worker count before creating a worker fails due to the
+    /// counter reaching the provided limit (core_size when attempting to create core thread, else
+    /// max_size) after being incremented by another thread, the pool tries to create
+    /// a non-core worker instead (if previously trying to create a core worker and no idle
+    /// worker exists) or sends the task to the channel instead. If incrementing the counter succeeded,
+    /// either because the current value of the counter matched the expected value or because the
+    /// last observed value was still below the limit, the worker starts with the provided task as
+    /// initial task and spawns its thread.
     ///
     /// # Errors
     ///
@@ -643,23 +654,59 @@ impl ThreadPool {
     fn try_execute_task(&self, task: Job) -> Result<(), crossbeam_channel::SendError<Job>> {
         // create a new worker either if the current worker count is lower than the core pool size
         // or if there are no idle threads and the current worker count is lower than the max pool size
-        let (curr_worker_count, idle_worker_count) = self.worker_data.worker_count_data.get_both();
+        let worker_count_data = &self.worker_data.worker_count_data;
+        let mut worker_count_val = worker_count_data.worker_count.load(Ordering::Relaxed);
+        let (mut curr_worker_count, idle_worker_count) = WorkerCountData::split(worker_count_val);
+        let mut curr_idle_count = idle_worker_count;
 
+        // always create a new worker if current pool size is below core size
         if curr_worker_count < self.core_size {
-            if let Err(task) =
-                self.create_worker(true, task, |_, old_val| old_val.0 < self.core_size)
+            let witnessed =
+                worker_count_data.try_increment_worker_total(worker_count_val, self.core_size);
+
+            // the witnessed value matched the expected value, meaning the initial exchange succeeded, or the final witnessed
+            // value is still below the coreSize, meaning the increment eventually succeeded
+            if witnessed == worker_count_val
+                || WorkerCountData::get_total_count(witnessed) < self.core_size
             {
-                return self.send_task_to_channel(task);
+                let worker = Worker::new(
+                    self.channel_data.receiver.clone(),
+                    Arc::clone(&self.worker_data),
+                    false,
+                    None,
+                );
+
+                worker.start(Some(task));
+                return Ok(());
             }
-        } else if curr_worker_count < self.max_size && idle_worker_count == 0 {
-            if let Err(task) = self.create_worker(false, task, ThreadPool::recheck_non_core) {
-                return self.send_task_to_channel(task);
-            }
-        } else {
-            return self.send_task_to_channel(task);
+
+            curr_worker_count = WorkerCountData::get_total_count(witnessed);
+            curr_idle_count = WorkerCountData::get_idle_count(witnessed);
+            worker_count_val = witnessed;
         }
 
-        Ok(())
+        // create a new worker if the current worker count is below the maxSize and the pool has been observed to be busy
+        // (no idle workers) during the invocation of this function
+        if curr_worker_count < self.max_size && (idle_worker_count == 0 || curr_idle_count == 0) {
+            let witnessed =
+                worker_count_data.try_increment_worker_total(worker_count_val, self.max_size);
+
+            if witnessed == worker_count_val
+                || WorkerCountData::get_total_count(witnessed) < self.max_size
+            {
+                let worker = Worker::new(
+                    self.channel_data.receiver.clone(),
+                    Arc::clone(&self.worker_data),
+                    true,
+                    Some(self.keep_alive),
+                );
+
+                worker.start(Some(task));
+                return Ok(());
+            }
+        }
+
+        self.send_task_to_channel(task)
     }
 
     /// Blocks the current thread until there aren't any non-idle threads anymore.
@@ -769,44 +816,6 @@ impl ThreadPool {
         &self.worker_data.pool_name
     }
 
-    /// Create a new worker then check the `recheck_condition`. If this still applies give the worker
-    /// the submitted task directly as its initial task. Else this method returns the task, which will
-    /// be given to the main channel instead.
-    fn create_worker<C>(&self, is_core: bool, task: Job, recheck_condition: C) -> Result<(), Job>
-    where
-        C: Fn(&ThreadPool, (u32, u32)) -> bool,
-    {
-        let worker = Worker::new(
-            self.channel_data.receiver.clone(),
-            Arc::clone(&self.worker_data),
-            !is_core,
-            if is_core { None } else { Some(self.keep_alive) },
-        );
-
-        let old_val = self
-            .worker_data
-            .worker_count_data
-            .increment_worker_total_ret_both();
-        if recheck_condition(&self, old_val) {
-            // new worker is still needed after checking again, give it the task and spawn the thread
-            worker.start(Some(task));
-        } else {
-            // recheck condition does not apply anymore, either there is an idle thread now (and is_core is false)
-            // or the worker has already been created by another thread
-            self.worker_data.worker_count_data.decrement_worker_total();
-
-            if is_core && old_val.0 < self.max_size && old_val.1 == 0 {
-                // if trying to create core thread failed try creating non-core thread instead
-
-                // have to use function pointer instead of closure due to recursive call
-                return self.create_worker(false, task, ThreadPool::recheck_non_core);
-            }
-            return Err(task);
-        }
-
-        Ok(())
-    }
-
     #[inline]
     fn send_task_to_channel(&self, task: Job) -> Result<(), crossbeam_channel::SendError<Job>> {
         self.channel_data.sender.send(task)?;
@@ -864,11 +873,6 @@ impl ThreadPool {
         };
     }
 
-    fn recheck_non_core(&self, old_val: (u32, u32)) -> bool {
-        let (old_worker_total, old_worker_idle) = old_val;
-        old_worker_total < self.max_size && old_worker_idle == 0
-    }
-
     #[inline]
     fn is_idle(
         current_worker_data: &Arc<WorkerData>,
@@ -885,7 +889,11 @@ impl Default for ThreadPool {
     /// and the max_size being twice the core size with a 60 second timeout
     fn default() -> Self {
         let num_cpus = num_cpus::get() as u32;
-        ThreadPool::new(num_cpus, num_cpus * 4, Duration::from_secs(60))
+        ThreadPool::new(
+            num_cpus,
+            std::cmp::max(num_cpus, num_cpus * 2),
+            Duration::from_secs(60),
+        )
     }
 }
 
@@ -938,9 +946,10 @@ impl Builder {
     }
 
     /// Build the `ThreadPool` using the parameters previously supplied to this `Builder` using the number of CPUs as
-    /// default core size if none provided, 4 times the core size as max size if none provided, 60 seconds keep_alive
-    /// if none provided and the default naming if none provided. This function calls [`ThreadPool::new`](struct.ThreadPool.html#method.new)
-    /// or [`ThreadPool::new_named`](struct.ThreadPool.html#method.new_named) depending on whether a name was provided.
+    /// default core size if none provided, twice the core size as max size if none provided, 60 seconds keep_alive
+    /// if none provided and the default naming (rusty_pool_{pool_number}) if none provided.
+    /// This function calls [`ThreadPool::new`](struct.ThreadPool.html#method.new) or
+    /// [`ThreadPool::new_named`](struct.ThreadPool.html#method.new_named) depending on whether a name was provided.
     ///
     /// # Panics
     ///
@@ -949,31 +958,16 @@ impl Builder {
         let core_size = self.core_size.unwrap_or_else(|| {
             let num_cpus = num_cpus::get() as u32;
             if let Some(max_size) = self.max_size {
-                if num_cpus <= max_size {
-                    num_cpus
-                } else {
-                    max_size
-                }
+                std::cmp::min(num_cpus, max_size)
             } else {
                 num_cpus
             }
         });
-        // handle potential u32 overflow: try using twice or four times the core_size or return the
-        // first result that did not overflow
-        let max_size = self.max_size.unwrap_or_else(|| {
-            let times_two = core_size * 2;
-            if times_two < core_size {
-                core_size
-            } else {
-                let times_four = core_size * 4;
-                if times_four < core_size {
-                    times_two
-                } else {
-                    times_four
-                }
-            }
-        });
-        let keep_alive = self.keep_alive.unwrap_or(Duration::from_secs(60));
+        // handle potential u32 overflow: try using twice the core_size or return core_size
+        let max_size = self
+            .max_size
+            .unwrap_or_else(|| std::cmp::max(core_size, core_size * 2));
+        let keep_alive = self.keep_alive.unwrap_or_else(|| Duration::from_secs(60));
 
         if let Some(name) = self.name {
             ThreadPool::new_named(name, core_size, max_size, keep_alive)
@@ -1012,7 +1006,7 @@ impl Worker {
             self.worker_data.pool_name,
             self.worker_data
                 .worker_number
-                .fetch_add(1, Ordering::SeqCst)
+                .fetch_add(1, Ordering::Relaxed)
         );
 
         thread::Builder::new()
@@ -1072,18 +1066,16 @@ impl Worker {
             .worker_data
             .worker_count_data
             .increment_worker_idle_ret_both();
-        if self.receiver.is_empty() {
-            // if the last task was the last one in the current generation,
-            // i.e. if incrementing the idle count leads to the idle count
-            // being equal to the total worker count, notify joiners
-            if old_total_count == old_idle_count + 1 {
-                let _lock = self
-                    .worker_data
-                    .join_notify_mutex
-                    .lock()
-                    .expect("could not get join notify mutex lock");
-                self.worker_data.join_notify_condvar.notify_all();
-            }
+        // if the last task was the last one in the current generation,
+        // i.e. if incrementing the idle count leads to the idle count
+        // being equal to the total worker count, notify joiners
+        if old_total_count == old_idle_count + 1 && self.receiver.is_empty() {
+            let _lock = self
+                .worker_data
+                .join_notify_mutex
+                .lock()
+                .expect("could not get join notify mutex lock");
+            self.worker_data.join_notify_condvar.notify_all();
         }
     }
 }
@@ -1116,7 +1108,7 @@ impl Drop for Sentinel<'_> {
             if self.is_working {
                 // worker thread panicked in the process of executing a submitted task,
                 // run the same logic as if the task completed normally and mark it as
-                // idle, since a clone of this task will start the work loop as idle
+                // idle, since a clone of this worker will start the work loop as idle
                 // thread
                 self.worker_ref.mark_idle_and_notify_joiners_if_no_work();
             }
@@ -1139,17 +1131,17 @@ struct WorkerCountData {
 
 impl WorkerCountData {
     fn get_total_worker_count(&self) -> u32 {
-        let curr_val = self.worker_count.load(Ordering::SeqCst);
+        let curr_val = self.worker_count.load(Ordering::Relaxed);
         WorkerCountData::get_total_count(curr_val)
     }
 
     fn get_idle_worker_count(&self) -> u32 {
-        let curr_val = self.worker_count.load(Ordering::SeqCst);
+        let curr_val = self.worker_count.load(Ordering::Relaxed);
         WorkerCountData::get_idle_count(curr_val)
     }
 
     fn get_both(&self) -> (u32, u32) {
-        let curr_val = self.worker_count.load(Ordering::SeqCst);
+        let curr_val = self.worker_count.load(Ordering::Relaxed);
         WorkerCountData::split(curr_val)
     }
 
@@ -1158,15 +1150,31 @@ impl WorkerCountData {
     fn increment_both(&self) -> (u32, u32) {
         let old_val = self
             .worker_count
-            .fetch_add(0x0000_0001_0000_0001, Ordering::SeqCst);
+            .fetch_add(0x0000_0001_0000_0001, Ordering::Relaxed);
         WorkerCountData::split(old_val)
     }
 
     fn decrement_both(&self) -> (u32, u32) {
         let old_val = self
             .worker_count
-            .fetch_sub(0x0000_0001_0000_0001, Ordering::SeqCst);
+            .fetch_sub(0x0000_0001_0000_0001, Ordering::Relaxed);
         WorkerCountData::split(old_val)
+    }
+
+    fn try_increment_worker_total(&self, mut expected: u64, max_total: u32) -> u64 {
+        loop {
+            let witness = self.worker_count.compare_and_swap(
+                expected,
+                expected + 0x0000_0001_0000_0000,
+                Ordering::Relaxed,
+            );
+
+            if witness == expected || WorkerCountData::get_total_count(witness) == max_total {
+                return witness;
+            }
+
+            expected = witness;
+        }
     }
 
     // keep for testing and completion's sake
@@ -1174,23 +1182,25 @@ impl WorkerCountData {
     fn increment_worker_total(&self) -> u32 {
         let old_val = self
             .worker_count
-            .fetch_add(0x0000_0001_0000_0000, Ordering::SeqCst);
+            .fetch_add(0x0000_0001_0000_0000, Ordering::Relaxed);
         WorkerCountData::get_total_count(old_val)
     }
 
-    // function that only increments the total worker count but return the old
-    // values of both fields. Used for the recheck when creating a new worker.
+    // keep for testing and completion's sake
+    #[allow(dead_code)]
     fn increment_worker_total_ret_both(&self) -> (u32, u32) {
         let old_val = self
             .worker_count
-            .fetch_add(0x0000_0001_0000_0000, Ordering::SeqCst);
+            .fetch_add(0x0000_0001_0000_0000, Ordering::Relaxed);
         WorkerCountData::split(old_val)
     }
 
+    // keep for testing and completion's sake
+    #[allow(dead_code)]
     fn decrement_worker_total(&self) -> u32 {
         let old_val = self
             .worker_count
-            .fetch_sub(0x0000_0001_0000_0000, Ordering::SeqCst);
+            .fetch_sub(0x0000_0001_0000_0000, Ordering::Relaxed);
         WorkerCountData::get_total_count(old_val)
     }
 
@@ -1199,7 +1209,7 @@ impl WorkerCountData {
     fn decrement_worker_total_ret_both(&self) -> (u32, u32) {
         let old_val = self
             .worker_count
-            .fetch_sub(0x0000_0001_0000_0000, Ordering::SeqCst);
+            .fetch_sub(0x0000_0001_0000_0000, Ordering::Relaxed);
         WorkerCountData::split(old_val)
     }
 
@@ -1208,21 +1218,21 @@ impl WorkerCountData {
     fn increment_worker_idle(&self) -> u32 {
         let old_val = self
             .worker_count
-            .fetch_add(0x0000_0000_0000_0001, Ordering::SeqCst);
+            .fetch_add(0x0000_0000_0000_0001, Ordering::Relaxed);
         WorkerCountData::get_idle_count(old_val)
     }
 
     fn increment_worker_idle_ret_both(&self) -> (u32, u32) {
         let old_val = self
             .worker_count
-            .fetch_add(0x0000_0000_0000_0001, Ordering::SeqCst);
+            .fetch_add(0x0000_0000_0000_0001, Ordering::Relaxed);
         WorkerCountData::split(old_val)
     }
 
     fn decrement_worker_idle(&self) -> u32 {
         let old_val = self
             .worker_count
-            .fetch_sub(0x0000_0000_0000_0001, Ordering::SeqCst);
+            .fetch_sub(0x0000_0000_0000_0001, Ordering::Relaxed);
         WorkerCountData::get_idle_count(old_val)
     }
 
@@ -1231,7 +1241,7 @@ impl WorkerCountData {
     fn decrement_worker_idle_ret_both(&self) -> (u32, u32) {
         let old_val = self
             .worker_count
-            .fetch_sub(0x0000_0000_0000_0001, Ordering::SeqCst);
+            .fetch_sub(0x0000_0000_0000_0001, Ordering::Relaxed);
         WorkerCountData::split(old_val)
     }
 
@@ -1270,6 +1280,7 @@ struct ChannelData {
 
 #[cfg(test)]
 mod tests {
+
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -1288,48 +1299,48 @@ mod tests {
 
         let count1 = count.clone();
         pool.execute(move || {
-            count1.fetch_add(1, Ordering::SeqCst);
+            count1.fetch_add(1, Ordering::Relaxed);
             thread::sleep(std::time::Duration::from_secs(4));
         });
         let count2 = count.clone();
         pool.execute(move || {
-            count2.fetch_add(1, Ordering::SeqCst);
+            count2.fetch_add(1, Ordering::Relaxed);
             thread::sleep(std::time::Duration::from_secs(4));
         });
         let count3 = count.clone();
         pool.execute(move || {
-            count3.fetch_add(1, Ordering::SeqCst);
+            count3.fetch_add(1, Ordering::Relaxed);
             thread::sleep(std::time::Duration::from_secs(4));
         });
         let count4 = count.clone();
         pool.execute(move || {
-            count4.fetch_add(1, Ordering::SeqCst);
+            count4.fetch_add(1, Ordering::Relaxed);
             thread::sleep(std::time::Duration::from_secs(4));
         });
         thread::sleep(std::time::Duration::from_secs(20));
         let count5 = count.clone();
         pool.execute(move || {
-            count5.fetch_add(1, Ordering::SeqCst);
+            count5.fetch_add(1, Ordering::Relaxed);
             thread::sleep(std::time::Duration::from_secs(4));
         });
         let count6 = count.clone();
         pool.execute(move || {
-            count6.fetch_add(1, Ordering::SeqCst);
+            count6.fetch_add(1, Ordering::Relaxed);
             thread::sleep(std::time::Duration::from_secs(4));
         });
         let count7 = count.clone();
         pool.execute(move || {
-            count7.fetch_add(1, Ordering::SeqCst);
+            count7.fetch_add(1, Ordering::Relaxed);
             thread::sleep(std::time::Duration::from_secs(4));
         });
         let count8 = count.clone();
         pool.execute(move || {
-            count8.fetch_add(1, Ordering::SeqCst);
+            count8.fetch_add(1, Ordering::Relaxed);
             thread::sleep(std::time::Duration::from_secs(4));
         });
         thread::sleep(std::time::Duration::from_secs(20));
 
-        let count = count.load(Ordering::SeqCst);
+        let count = count.load(Ordering::Relaxed);
         let worker_count = pool.get_current_worker_count();
 
         assert_eq!(count, 8);
@@ -1351,7 +1362,7 @@ mod tests {
                 for _ in 0..160 {
                     let clone = clone.clone();
                     pool_1.execute(move || {
-                        clone.fetch_add(1, Ordering::SeqCst);
+                        clone.fetch_add(1, Ordering::Relaxed);
                         thread::sleep(Duration::from_secs(10));
                     });
                 }
@@ -1361,7 +1372,7 @@ mod tests {
                 for _ in 0..160 {
                     let clone = clone.clone();
                     pool_1.execute(move || {
-                        clone.fetch_add(1, Ordering::SeqCst);
+                        clone.fetch_add(1, Ordering::Relaxed);
                         thread::sleep(Duration::from_secs(10));
                     });
                 }
@@ -1372,7 +1383,7 @@ mod tests {
         assert_eq!(pool.get_current_worker_count(), 50);
 
         pool.join();
-        assert_eq!(counter.load(Ordering::SeqCst), 1600);
+        assert_eq!(counter.load(Ordering::Relaxed), 1600);
         thread::sleep(Duration::from_secs(31));
         assert_eq!(pool.get_current_worker_count(), 3);
     }
@@ -1387,18 +1398,18 @@ mod tests {
         let clone_1 = counter.clone();
         pool.execute(move || {
             thread::sleep(Duration::from_secs(5));
-            clone_1.fetch_add(1, Ordering::SeqCst);
+            clone_1.fetch_add(1, Ordering::Relaxed);
         });
 
         let clone_2 = counter.clone();
         pool.execute(move || {
             thread::sleep(Duration::from_secs(5));
-            clone_2.fetch_add(1, Ordering::SeqCst);
+            clone_2.fetch_add(1, Ordering::Relaxed);
         });
 
         pool.join();
 
-        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -1409,13 +1420,13 @@ mod tests {
         let clone = counter.clone();
         pool.execute(move || {
             thread::sleep(Duration::from_secs(10));
-            clone.fetch_add(1, Ordering::SeqCst);
+            clone.fetch_add(1, Ordering::Relaxed);
         });
 
         pool.join_timeout(Duration::from_secs(5));
-        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
         pool.join();
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1426,26 +1437,26 @@ mod tests {
         let clone_1 = counter.clone();
         pool.execute(move || {
             thread::sleep(Duration::from_secs(5));
-            clone_1.fetch_add(1, Ordering::SeqCst);
+            clone_1.fetch_add(1, Ordering::Relaxed);
         });
 
         let clone_2 = counter.clone();
         pool.execute(move || {
             thread::sleep(Duration::from_secs(5));
-            clone_2.fetch_add(1, Ordering::SeqCst);
+            clone_2.fetch_add(1, Ordering::Relaxed);
         });
 
         let clone_3 = counter.clone();
         pool.execute(move || {
             thread::sleep(Duration::from_secs(5));
-            clone_3.fetch_add(1, Ordering::SeqCst);
+            clone_3.fetch_add(1, Ordering::Relaxed);
         });
 
         // since the pool only allows three threads this won't get the chance to run
         let clone_4 = counter.clone();
         pool.execute(move || {
             thread::sleep(Duration::from_secs(5));
-            clone_4.fetch_add(1, Ordering::SeqCst);
+            clone_4.fetch_add(1, Ordering::Relaxed);
         });
 
         pool.join_timeout(Duration::from_secs(2));
@@ -1453,7 +1464,7 @@ mod tests {
 
         thread::sleep(Duration::from_secs(5));
 
-        assert_eq!(counter.load(Ordering::SeqCst), 3);
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
     }
 
     #[should_panic(
@@ -1516,11 +1527,11 @@ mod tests {
         let clone = counter.clone();
         pool.execute(move || {
             thread::sleep(Duration::from_secs(10));
-            clone.fetch_add(1, Ordering::SeqCst);
+            clone.fetch_add(1, Ordering::Relaxed);
         });
 
         pool.shutdown_join();
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1531,11 +1542,11 @@ mod tests {
         let clone = counter.clone();
         pool.execute(move || {
             thread::sleep(Duration::from_secs(10));
-            clone.fetch_add(1, Ordering::SeqCst);
+            clone.fetch_add(1, Ordering::Relaxed);
         });
 
         pool.shutdown_join_timeout(Duration::from_secs(5));
-        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1554,14 +1565,14 @@ mod tests {
             let clone = counter.clone();
             pool.execute(move || {
                 thread::sleep(Duration::from_secs(2));
-                clone.fetch_add(1, Ordering::SeqCst);
+                clone.fetch_add(1, Ordering::Relaxed);
             });
         }
 
         assert_eq!(pool.get_current_worker_count(), 5);
         assert_eq!(pool.get_idle_worker_count(), 0);
         pool.shutdown_join();
-        assert_eq!(counter.load(Ordering::SeqCst), 7);
+        assert_eq!(counter.load(Ordering::Relaxed), 7);
 
         // give the workers time to exit
         thread::sleep(Duration::from_millis(50));
@@ -1578,12 +1589,12 @@ mod tests {
         for _ in 0..5 {
             let clone = counter.clone();
             pool.execute(move || {
-                clone.fetch_add(1, Ordering::SeqCst);
+                clone.fetch_add(1, Ordering::Relaxed);
             });
         }
 
         pool.shutdown_join();
-        assert_eq!(counter.load(Ordering::SeqCst), 5);
+        assert_eq!(counter.load(Ordering::Relaxed), 5);
 
         // give the workers time to exit
         thread::sleep(Duration::from_millis(50));
@@ -1695,6 +1706,52 @@ mod tests {
     }
 
     #[test]
+    fn test_try_increment_worker_total() {
+        let worker_count_data = WorkerCountData::default();
+
+        let witness = worker_count_data.try_increment_worker_total(0, 5);
+        assert_eq!(witness, 0);
+        assert_eq!(worker_count_data.get_total_worker_count(), 1);
+        assert_eq!(worker_count_data.get_idle_worker_count(), 0);
+
+        let witness = worker_count_data.try_increment_worker_total(0, 5);
+        assert_eq!(witness, 0x0000_0001_0000_0000);
+        assert_eq!(worker_count_data.get_total_worker_count(), 2);
+        assert_eq!(worker_count_data.get_idle_worker_count(), 0);
+
+        worker_count_data.try_increment_worker_total(2, 5);
+        worker_count_data.try_increment_worker_total(2, 5);
+        worker_count_data.try_increment_worker_total(4, 5);
+        worker_count_data.try_increment_worker_total(4, 5);
+        let witness = worker_count_data.try_increment_worker_total(2, 5);
+        assert_eq!(WorkerCountData::get_total_count(witness), 5);
+        assert_eq!(WorkerCountData::get_idle_count(witness), 0);
+        assert_eq!(worker_count_data.get_total_worker_count(), 5);
+        assert_eq!(worker_count_data.get_idle_worker_count(), 0);
+
+        let worker_count_data = Arc::new(worker_count_data);
+
+        let mut join_handles = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let worker_count_data = worker_count_data.clone();
+            let join_handle = thread::spawn(move || {
+                for i in 0..5 {
+                    worker_count_data.try_increment_worker_total(5 + i, 15);
+                }
+            });
+
+            join_handles.push(join_handle);
+        }
+
+        for join_handle in join_handles {
+            join_handle.join().unwrap();
+        }
+
+        assert_eq!(worker_count_data.get_total_worker_count(), 15);
+        assert_eq!(worker_count_data.get_idle_worker_count(), 0);
+    }
+
+    #[test]
     fn test_join_enqueued_task() {
         let pool = ThreadPool::new(3, 50, Duration::from_secs(20));
         let counter = Arc::new(AtomicUsize::new(0));
@@ -1703,7 +1760,7 @@ mod tests {
             let clone = counter.clone();
             pool.execute(move || {
                 thread::sleep(Duration::from_secs(10));
-                clone.fetch_add(1, Ordering::SeqCst);
+                clone.fetch_add(1, Ordering::Relaxed);
             });
         }
 
@@ -1711,7 +1768,7 @@ mod tests {
         assert_eq!(pool.get_current_worker_count(), 50);
 
         pool.join();
-        assert_eq!(counter.load(Ordering::SeqCst), 160);
+        assert_eq!(counter.load(Ordering::Relaxed), 160);
         thread::sleep(Duration::from_secs(21));
         assert_eq!(pool.get_current_worker_count(), 3);
     }
@@ -1742,7 +1799,7 @@ mod tests {
             pool.execute(move || {
                 if i < 3 || i % 2 == 0 {
                     thread::sleep(Duration::from_secs(5));
-                    clone.fetch_add(1, Ordering::SeqCst);
+                    clone.fetch_add(1, Ordering::Relaxed);
                 } else {
                     thread::sleep(Duration::from_secs(5));
                     panic!("test");
@@ -1751,7 +1808,7 @@ mod tests {
         }
 
         pool.join();
-        assert_eq!(counter.load(Ordering::SeqCst), 6);
+        assert_eq!(counter.load(Ordering::Relaxed), 6);
         assert_eq!(pool.get_current_worker_count(), 10);
         assert_eq!(pool.get_idle_worker_count(), 10);
         thread::sleep(Duration::from_secs(10));
@@ -1776,7 +1833,7 @@ mod tests {
             let clone = counter.clone();
             pool.execute(move || {
                 if i < 3 || i % 2 == 0 {
-                    clone.fetch_add(1, Ordering::SeqCst);
+                    clone.fetch_add(1, Ordering::Relaxed);
                 } else {
                     thread::sleep(Duration::from_secs(5));
                     panic!("test");
@@ -1785,7 +1842,7 @@ mod tests {
         }
 
         pool.join();
-        assert_eq!(counter.load(Ordering::SeqCst), 6);
+        assert_eq!(counter.load(Ordering::Relaxed), 6);
         assert_eq!(pool.get_current_worker_count(), 3);
         assert_eq!(pool.get_idle_worker_count(), 3);
     }
@@ -1798,24 +1855,24 @@ mod tests {
         for _ in 0..3 {
             let clone = counter.clone();
             pool.execute(move || {
-                clone.fetch_add(1, Ordering::SeqCst);
+                clone.fetch_add(1, Ordering::Relaxed);
             })
         }
 
         pool.join();
-        assert_eq!(counter.load(Ordering::SeqCst), 3);
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
         thread::sleep(Duration::from_secs(10));
         assert_eq!(pool.get_current_worker_count(), 0);
 
         for _ in 0..3 {
             let clone = counter.clone();
             pool.execute(move || {
-                clone.fetch_add(1, Ordering::SeqCst);
+                clone.fetch_add(1, Ordering::Relaxed);
             })
         }
 
         pool.join();
-        assert_eq!(counter.load(Ordering::SeqCst), 6);
+        assert_eq!(counter.load(Ordering::Relaxed), 6);
     }
 
     #[test]
@@ -1825,9 +1882,9 @@ mod tests {
         let count = AtomicUsize::new(0);
 
         let handle = pool.evaluate(move || {
-            count.fetch_add(1, Ordering::SeqCst);
+            count.fetch_add(1, Ordering::Relaxed);
             thread::sleep(Duration::from_secs(5));
-            count.fetch_add(1, Ordering::SeqCst)
+            count.fetch_add(1, Ordering::Relaxed)
         });
 
         let result = handle.await_complete();
@@ -1841,16 +1898,16 @@ mod tests {
         let count = AtomicUsize::new(0);
         let handle_1 = pool.evaluate(move || {
             for _ in 0..10000 {
-                count.fetch_add(1, Ordering::SeqCst);
+                count.fetch_add(1, Ordering::Relaxed);
             }
 
             thread::sleep(Duration::from_secs(5));
 
             for _ in 0..10000 {
-                count.fetch_add(1, Ordering::SeqCst);
+                count.fetch_add(1, Ordering::Relaxed);
             }
 
-            count.load(Ordering::SeqCst)
+            count.load(Ordering::Relaxed)
         });
 
         let handle_2 = pool.evaluate(move || {
@@ -1924,11 +1981,11 @@ mod tests {
             let d = multiply(a, add(2, 1).await).await; // 15
             let e = add(c, d).await; // 29
 
-            clone.fetch_add(e as usize, Ordering::SeqCst);
+            clone.fetch_add(e as usize, Ordering::Relaxed);
         });
 
         pool.join();
-        assert_eq!(count.load(Ordering::SeqCst), 29);
+        assert_eq!(count.load(Ordering::Relaxed), 29);
     }
 
     #[cfg(feature = "async")]
@@ -1964,7 +2021,7 @@ mod tests {
 
         drop(handle);
         thread::sleep(Duration::from_secs(10));
-        let current_thread_index = pool.worker_data.worker_number.load(Ordering::SeqCst);
+        let current_thread_index = pool.worker_data.worker_number.load(Ordering::Relaxed);
         // current worker number of 2 means that one worker has started (initial number is 1 -> first worker gets and increments number)
         // indicating that the worker did not panic else it would have been replaced.
         assert_eq!(current_thread_index, 2);
@@ -1983,19 +2040,19 @@ mod tests {
         let clone1 = count.clone();
         pool.execute(move || {
             thread::sleep(Duration::from_secs(10));
-            clone1.fetch_add(1, Ordering::SeqCst);
+            clone1.fetch_add(1, Ordering::Relaxed);
         });
 
         let clone2 = count.clone();
         pool.execute(move || {
             thread::sleep(Duration::from_secs(10));
-            clone2.fetch_add(1, Ordering::SeqCst);
+            clone2.fetch_add(1, Ordering::Relaxed);
         });
 
         let clone3 = count.clone();
         pool.execute(move || {
             thread::sleep(Duration::from_secs(10));
-            clone3.fetch_add(1, Ordering::SeqCst);
+            clone3.fetch_add(1, Ordering::Relaxed);
         });
 
         let pool2 = pool.clone();
@@ -2004,7 +2061,7 @@ mod tests {
             thread::sleep(Duration::from_secs(5));
             pool2.execute(move || {
                 thread::sleep(Duration::from_secs(15));
-                clone4.fetch_add(2, Ordering::SeqCst);
+                clone4.fetch_add(2, Ordering::Relaxed);
             });
         });
 
@@ -2024,6 +2081,6 @@ mod tests {
         h2.join().unwrap();
         h3.join().unwrap();
 
-        assert_eq!(count.load(Ordering::SeqCst), 5);
+        assert_eq!(count.load(Ordering::Relaxed), 5);
     }
 }

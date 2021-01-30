@@ -39,12 +39,13 @@ default-features = false
 version = "*"
 ```
 
-When creating a new worker this `ThreadPool` always re-checks whether the new worker
-is still required before spawning a thread and passing it the submitted task in case
-an idle thread has opened up in the meantime or another thread has already created
-the worker. If the re-check failed for a core worker the pool will try creating a
-new non-core worker before deciding no new worker is needed. Panicking workers are
-always cloned and replaced.
+When creating a new worker this `ThreadPool` tries to increment the worker count
+using a compare-and-swap mechanism, if the increment fails because the total worker
+count has been incremented to the specified limit (the core_size when trying to
+create a core thread, else the max_size) by another thread, the pool tries to create
+a non-core worker instead (if previously trying to create a core worker and no idle
+worker exists) or sends the task to the channel instead. Panicking workers are always
+cloned and replaced.
 
 Locks are only used for the join functions to lock the `Condvar`, apart from that
 this `ThreadPool` implementation fully relies on crossbeam and atomic operations.
@@ -56,6 +57,23 @@ they may be updated in a single atomic operation.
 The thread pool and its crossbeam channel can be destroyed by using the shutdown
 function, however that does not stop tasks that are already running but will
 terminate the thread the next time it will try to fetch work from the channel.
+The channel is only destroyed once all clones of the `ThreadPool` have been
+shut down / dropped.
+
+# Installation
+
+To add rusty_pool to your project simply add the following Cargo dependency:
+```toml
+[dependencies]
+rusty_pool = "0.5.0"
+```
+
+Or to exclude the "async" feature:
+```toml
+[dependencies.rusty_pool]
+version = "0.5.0"
+default-features = false
+```
 
 # Usage
 Create a new `ThreadPool`:
@@ -165,17 +183,156 @@ pool.shutdown_join();
 assert_eq!(count.load(Ordering::SeqCst), 15);
 ```
 
-# Installation
+# Performance
+In terms of performance from the perspective of a thread submitting tasks to the pool, rusty_pool should offer better
+performance than any pool using std::sync::mpsc (such as rust-threadpool) in most scenarios thanks to the great work of
+the crossbeam team. In some cases with extreme contention rusty_pool might fall behind rust-threadpool, though the scenarios
+where this has been found to be the case are hardly practical as they require to submit empty tasks in a loop and it depends
+on the platform. macOS seems to perform particularly well in the tested scenario, presumably macOS has spent a lot of
+effort optimising atomic operations as Swift's reference counting depends on it. Apparently this should be amplified on
+Apple Silicon but rusty_pool has not been tested on that platform. The following tests were executed on a PC with an
+AMD Ryzen 9 3950X for Linux and Windows and on a MacBook Pro 15" 2019 with an Intel i9-9880H for macOS.
 
-To add rusty_pool to your project simply add the following Cargo dependency:
-```toml
-[dependencies]
-rusty_pool = "0.4.3"
+### Test 1: No contention
+All tasks are submitted by the same thread and the task lasts longer than the test, meaning all atomic operations
+(reading and incrementing the worker counter) are performed by the main thread, since newly created workers do not
+alter the counter until after they completed their initial task and increment the idle counter.
+
+```rust
+fn main() {
+    let now = std::time::Instant::now();
+
+    let pool = rusty_pool::Builder::new().core_size(10).max_size(10).build();
+    //let pool = threadpool::ThreadPool::new(10);
+
+    for _ in 0..10000000 {
+        pool.execute(|| {
+            thread::sleep(std::time::Duration::from_secs(1));
+        });
+    }
+
+    let millis = now.elapsed().as_millis();
+    println!("millis: {}", millis);
+}
 ```
 
-Or to exclude the "async" feature:
-```toml
-[dependencies.rusty_pool]
-version = "0.4.3"
-default-features = false
+Results (in milliseconds, average value):
+
+rusty_pool 0.5.0:
+
+| Windows | MacOS | Linux |
+|---------|-------|-------|
+| 224.6   | 315.6 | 187.0 |
+
+rust-threadpool 1.8.1:
+
+| Windows | MacOS | Linux |
+|---------|-------|-------|
+| 476.4   | 743.4 | 354.3 |
+
+rusty_pool 0.4.3:
+
+| Windows | MacOS | Linux |
+|---------|-------|-------|
+| 237.5   | 318.1 | 181.3 |
+
+### Test 2: Multiple producers
+Next to the main thread there are 10 other threads submitting tasks to the pool. Unlike the previous test, the task no
+longer lasts longer than the test, thus there not only is contention between the producers for the worker counter but also
+between the worker threads updating the idle counter. This is a somewhat realistic albeit extreme example.
+
+```rust
+fn main() {
+    let now = std::time::Instant::now();
+
+    let pool = rusty_pool::Builder::new().core_size(10).max_size(10).build();
+    //let pool = threadpool::ThreadPool::new(10);
+
+    for _ in 0..10 {
+        let pool = pool.clone();
+
+        std::thread::spawn(move || {
+            for _ in 0..10000000 {
+                pool.execute(|| {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                });
+            }
+        });
+    }
+
+    for _ in 0..10000000 {
+        pool.execute(|| {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        });
+    }
+
+    let millis = now.elapsed().as_millis();
+    println!("millis: {}", millis);
+}
 ```
+
+Results (in milliseconds, average value):
+
+rusty_pool 0.5.0:
+
+| Windows  | MacOS  | Linux  |
+|----------|--------|--------|
+| 6251.0   | 4417.7 | 7903.1 |
+
+rust-threadpool 1.8.1:
+
+| Windows  | MacOS  | Linux  |
+|----------|--------|--------|
+| 10030.5  | 5810.5 | 9743.3 |
+
+rusty_pool 0.4.3:
+
+| Windows  | MacOS  | Linux  |
+|----------|--------|--------|
+| 6342.2   | 4444.6 | 7962.0 |
+
+### Test 3: Worst case
+This test case highlights the aforementioned worst-case scenario for rusty_pool where the pool is spammed with empty
+tasks. Since workers increment the idle counter after completing a task and the task is executed practically immediately,
+the increment of the idle counter coincides with the next execute() call in the loop reading the counter. The higher the
+number of workers the higher contention gets and the worse performance becomes.
+
+```rust
+fn main() {
+    let now = std::time::Instant::now();
+
+    let pool = rusty_pool::Builder::new().core_size(10).max_size(10).build();
+    //let pool = threadpool::ThreadPool::new(10);
+
+    for _ in 0..10000000 {
+        pool.execute(|| {});
+    }
+
+    let millis = now.elapsed().as_millis();
+    println!("millis: {}", millis);
+}
+```
+
+rusty_pool 0.5.0:
+
+| Windows  | MacOS  | Linux  |
+|----------|--------|--------|
+| 1991.6   | 679.93 | 2175.1 |
+
+rust-threadpool 1.8.1:
+
+| Windows  | MacOS  | Linux  |
+|----------|--------|--------|
+| 980.33   | 1224.6 | 677.0  |
+
+rusty_pool 0.4.3:
+
+| Windows  | MacOS  | Linux  |
+|----------|--------|--------|
+| 2016.8   | 683.13 | 2175.1 |
+
+Curiously, macOS heavily favours rusty_pool in this case while Windows and Linux favour rust-threadpool. However, this test
+case should hardly occur in a real world scenario. In all other tested scenarios rusty_pool performs better when submitting
+tasks, where macOS seems to gain a lead in cases where there is a lot of contention but falling behind in other cases,
+possibly due to the weaker hardware of the specific device used for testing. Linux seems to perform best in cases with
+little to no contention but performs the worst when contention is high.

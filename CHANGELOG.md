@@ -1,3 +1,27 @@
+## [0.5.0] - 2021-01-30
+
+  * Instead of incrementing the worker total and using the returned
+    previous value to check if the worker is still required and then
+    decrementing the counter again if that's not the case, use a compare
+    and swap mechanism implemented by WorkerCountData::try_increment_worker_total
+    to increment the total count if the current workerCountData matches
+    the expected value and retry until it succeeds or until the observed
+    value reaches the provided maximum value (either the core pool size
+    when attempting to create a core worker, else the max pool size),
+    at which point the pool proceeds to creating a non-core worker or
+    to sending the task to the channel.
+    * This only requires one atomic operation per retry instead of 2 (if
+      contention is high it may lead to more retries as increments could
+      not fail before but retries are much cheaper as it does not have to
+      decrement the counter and recursively call the method) and
+      guarantees that the total worker count is always accurate.
+  * Use Ordering::Relaxed instead of SeqCst as the relaxed ordering suffices when incrementing a counter.
+  * ThreadPool::default: Handle possible u32 overflow when calculating max_size.
+  * Update dependencies.
+  * Use twice the core count instead of 4 times the core count as default max_size.
+  * Worker::mark_idle_and_notify_joiners_if_no_work: Check whether old_total_count equals old_idle_count + 1 before
+    checking whether the receiver is empty as it is the cheaper operation.
+
 ## [0.4.3] - 2020-08-11
 
   * _do_join(): recheck whether the pool has become idle after acquiring the lock
