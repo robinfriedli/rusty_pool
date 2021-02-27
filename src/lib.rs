@@ -1163,17 +1163,18 @@ impl WorkerCountData {
 
     fn try_increment_worker_total(&self, mut expected: u64, max_total: u32) -> u64 {
         loop {
-            let witness = self.worker_count.compare_and_swap(
+            match self.worker_count.compare_exchange_weak(
                 expected,
                 expected + 0x0000_0001_0000_0000,
                 Ordering::Relaxed,
-            );
-
-            if witness == expected || WorkerCountData::get_total_count(witness) == max_total {
-                return witness;
+                Ordering::Relaxed,
+            ) {
+                Ok(witnessed) => return witnessed,
+                Err(witnessed) if WorkerCountData::get_total_count(witnessed) == max_total => {
+                    return witnessed
+                }
+                Err(witnessed) => expected = witnessed,
             }
-
-            expected = witness;
         }
     }
 

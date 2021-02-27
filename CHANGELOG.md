@@ -1,3 +1,8 @@
+## [0.5.1] - 2021-02-27
+
+  * Replace compare_and_swap with compare_exchange_weak.
+    * compare_and_swap has been deprecated as of rust 1.50.0
+
 ## [0.5.0] - 2021-01-30
 
   * Instead of incrementing the worker total and using the returned
