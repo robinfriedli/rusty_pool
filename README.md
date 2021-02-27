@@ -65,13 +65,13 @@ shut down / dropped.
 To add rusty_pool to your project simply add the following Cargo dependency:
 ```toml
 [dependencies]
-rusty_pool = "0.5.0"
+rusty_pool = "0.5.1"
 ```
 
 Or to exclude the "async" feature:
 ```toml
 [dependencies.rusty_pool]
-version = "0.5.0"
+version = "0.5.1"
 default-features = false
 ```
 
@@ -218,6 +218,12 @@ fn main() {
 
 Results (in milliseconds, average value):
 
+rusty_pool 0.5.1:
+
+| Windows | MacOS | Linux |
+|---------|-------|-------|
+| 221.6   | 293.07| 183.73|
+
 rusty_pool 0.5.0:
 
 | Windows | MacOS | Linux |
@@ -273,11 +279,17 @@ fn main() {
 
 Results (in milliseconds, average value):
 
+rusty_pool 0.5.1:
+
+| Windows* | MacOS  | Linux  |
+|----------|--------|--------|
+| 7692.4   | 3656.2 | 7514.53|
+
 rusty_pool 0.5.0:
 
-| Windows  | MacOS  | Linux  |
-|----------|--------|--------|
-| 6251.0   | 4417.7 | 7903.1 |
+| Windows  | MacOS  | Linux  | Windows*|
+|----------|--------|--------|---------|
+| 6251.0   | 4417.7 | 7903.1 | 7774.67 |
 
 rust-threadpool 1.8.1:
 
@@ -287,9 +299,15 @@ rust-threadpool 1.8.1:
 
 rusty_pool 0.4.3:
 
-| Windows  | MacOS  | Linux  |
-|----------|--------|--------|
-| 6342.2   | 4444.6 | 7962.0 |
+| Windows  | MacOS  | Linux  | Windows*|
+|----------|--------|--------|---------|
+| 6342.2   | 4444.6 | 7962.0 | 8564.93 |
+
+&ast; When testing 0.5.1 the performance for Windows appeared to be considerably worse, so the results for previous versions
+of rusty_pool were recalculated and also found to be worse than when originally recorded, probably due to external
+influence (e.g. background task taking a lot of CPU time, though the test was retried with realtime priority with similar
+results). The results for rust-threadpool 1.8.1 were not fully recalculated as they appeared to be similar to the last
+recording.
 
 ### Test 3: Worst case
 This test case highlights the aforementioned worst-case scenario for rusty_pool where the pool is spammed with empty
@@ -312,6 +330,12 @@ fn main() {
     println!("millis: {}", millis);
 }
 ```
+
+rusty_pool 0.5.1:
+
+| Windows  | MacOS  | Linux  |
+|----------|--------|--------|
+| 1967.93  | 698.8  | 2150.0 |
 
 rusty_pool 0.5.0:
 
