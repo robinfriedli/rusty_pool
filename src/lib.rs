@@ -12,7 +12,7 @@ use std::sync::{
     Arc, Condvar, Mutex,
 };
 #[cfg(feature = "async")]
-use std::task::{Context, Poll};
+use std::task::Context;
 use std::thread;
 use std::time::Duration;
 
@@ -30,9 +30,9 @@ pub trait Task<R: Send>: Send {
     ///
     /// Used by [`ThreadPool::execute`](struct.ThreadPool.html#method.execute) to turn this `Task` into a `Job`
     /// directly without having to create an additional `Job` that calls this `Task`.
-    fn as_fn(self) -> Option<Box<dyn FnOnce() -> R + Send + 'static>>;
+    fn into_fn(self) -> Option<Box<dyn FnOnce() -> R + Send + 'static>>;
 
-    /// Return `true` if calling [`as_fn()`](trait.Task.html#method.as_fn) on this `Task` returns `Some`.
+    /// Return `true` if calling [`Task::into_fn`] on this `Task` returns `Some`.
     fn is_fn(&self) -> bool;
 }
 
@@ -46,7 +46,7 @@ where
         self()
     }
 
-    fn as_fn(self) -> Option<Box<dyn FnOnce() -> R + Send + 'static>> {
+    fn into_fn(self) -> Option<Box<dyn FnOnce() -> R + Send + 'static>> {
         Some(Box::new(self))
     }
 
@@ -115,13 +115,13 @@ impl Task<()> for Arc<AsyncTask> {
         if let Some(mut future) = future_slot.take() {
             let waker = waker_ref(&self);
             let context = &mut Context::from_waker(&*waker);
-            if let Poll::Pending = future.as_mut().poll(context) {
+            if future.as_mut().poll(context).is_pending() {
                 *future_slot = Some(future);
             }
         }
     }
 
-    fn as_fn(self) -> Option<Box<dyn FnOnce() + Send + 'static>> {
+    fn into_fn(self) -> Option<Box<dyn FnOnce() + Send + 'static>> {
         None
     }
 
@@ -472,8 +472,8 @@ impl ThreadPool {
     ) -> Result<(), crossbeam_channel::SendError<Job>> {
         if task.is_fn() {
             self.try_execute_task(
-                task.as_fn()
-                    .expect("Task::as_fn returned None despite is_fn returning true"),
+                task.into_fn()
+                    .expect("Task::into_fn returned None despite is_fn returning true"),
             )
         } else {
             self.try_execute_task(Box::new(move || {
