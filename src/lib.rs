@@ -8,13 +8,16 @@ use futures_executor::block_on;
 use std::future::Future;
 use std::option::Option;
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
     Arc, Condvar, Mutex,
 };
 #[cfg(feature = "async")]
 use std::task::{Context, Poll};
 use std::thread;
 use std::time::Duration;
+
+const BITS: usize = std::mem::size_of::<usize>() * 8;
+const MAX_SIZE: usize = (1 << (BITS / 2)) - 1;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
@@ -187,8 +190,8 @@ impl ThreadSafe for ThreadPool {}
 /// this `ThreadPool` implementation fully relies on crossbeam and atomic operations.
 /// This `ThreadPool` decides whether it is currently idle (and should fast-return
 /// join attempts) by comparing the total worker count to the idle worker count, which
-/// are two `u32` values stored in one `AtomicU64` making sure that if both are updated
-/// they may be updated in a single atomic operation.
+/// are two values stored in one `AtomicUsize` (both half the size of usize) making sure
+/// that if both are updated they may be updated in a single atomic operation.
 ///
 /// The thread pool and its crossbeam channel can be destroyed by using the shutdown
 /// function, however that does not stop tasks that are already running but will
@@ -305,8 +308,8 @@ impl ThreadSafe for ThreadPool {}
 /// ```
 #[derive(Clone)]
 pub struct ThreadPool {
-    core_size: u32,
-    max_size: u32,
+    core_size: usize,
+    max_size: usize,
     keep_alive: Duration,
     channel_data: Arc<ChannelData>,
     worker_data: Arc<WorkerData>,
@@ -329,8 +332,10 @@ impl ThreadPool {
     ///
     /// # Panics
     ///
-    /// This function will panic if max_size is 0 or lower than core_size.
-    pub fn new(core_size: u32, max_size: u32, keep_alive: Duration) -> Self {
+    /// This function will panic if max_size is 0, lower than core_size or exceeds half
+    /// the size of usize. This restriction exists because two counters (total workers and
+    /// idle counters) are stored within one AtomicUsize.
+    pub fn new(core_size: usize, max_size: usize, keep_alive: Duration) -> Self {
         static POOL_COUNTER: AtomicUsize = AtomicUsize::new(1);
         let name = format!(
             "rusty_pool_{}",
@@ -357,12 +362,21 @@ impl ThreadPool {
     ///
     /// # Panics
     ///
-    /// This function will panic if max_size is 0 or lower than core_size.
-    pub fn new_named(name: String, core_size: u32, max_size: u32, keep_alive: Duration) -> Self {
+    /// This function will panic if max_size is 0, lower than core_size or exceeds half
+    /// the size of usize. This restriction exists because two counters (total workers and
+    /// idle counters) are stored within one AtomicUsize.
+    pub fn new_named(
+        name: String,
+        core_size: usize,
+        max_size: usize,
+        keep_alive: Duration,
+    ) -> Self {
         let (sender, receiver) = crossbeam_channel::unbounded();
 
         if max_size == 0 || max_size < core_size {
             panic!("max_size must be greater than 0 and greater or equal to the core pool size");
+        } else if max_size > MAX_SIZE {
+            panic!("max_size may not be larger than half the size of usize");
         }
 
         let worker_data = WorkerData {
@@ -395,7 +409,7 @@ impl ThreadPool {
     /// This counter is decremented when a worker reaches the end of its working loop, which for non-core
     /// threads might happen if it does not receive any work during its keep alive time,
     /// for core threads this only happens once the channel is disconnected.
-    pub fn get_current_worker_count(&self) -> u32 {
+    pub fn get_current_worker_count(&self) -> usize {
         self.worker_data.worker_count_data.get_total_worker_count()
     }
 
@@ -403,7 +417,7 @@ impl ThreadPool {
     /// polling from the crossbeam receiver. Core threads wait indefinitely and might remain
     /// in this state until the `ThreadPool` is dropped. The remaining threads give up after
     /// waiting for the specified keep_alive time.
-    pub fn get_idle_worker_count(&self) -> u32 {
+    pub fn get_idle_worker_count(&self) -> usize {
         self.worker_data.worker_count_data.get_idle_worker_count()
     }
 
@@ -888,7 +902,7 @@ impl Default for ThreadPool {
     /// create default ThreadPool with the core pool size being equal to the number of cpus
     /// and the max_size being twice the core size with a 60 second timeout
     fn default() -> Self {
-        let num_cpus = num_cpus::get() as u32;
+        let num_cpus = num_cpus::get();
         ThreadPool::new(
             num_cpus,
             std::cmp::max(num_cpus, num_cpus * 2),
@@ -902,8 +916,8 @@ impl Default for ThreadPool {
 #[derive(Default)]
 pub struct Builder {
     name: Option<String>,
-    core_size: Option<u32>,
-    max_size: Option<u32>,
+    core_size: Option<usize>,
+    max_size: Option<usize>,
     keep_alive: Option<Duration>,
 }
 
@@ -923,7 +937,7 @@ impl Builder {
     /// Specify the core pool size for the `ThreadPool`. The core pool size is the number of threads that stay alive
     /// for the entire lifetime of the `ThreadPool` or, to be more precise, its channel. These threads are spawned if
     /// a task is submitted to the `ThreadPool` and the current worker count is below the core pool size.
-    pub fn core_size(mut self, size: u32) -> Builder {
+    pub fn core_size(mut self, size: usize) -> Builder {
         self.core_size = Some(size);
         self
     }
@@ -933,7 +947,7 @@ impl Builder {
     /// only remain idle for the duration specified by the `keep_alive` parameter before terminating. If the core pool
     /// is full, the current pool size is below the max size and there are no idle threads then additional threads
     /// will be spawned.
-    pub fn max_size(mut self, size: u32) -> Builder {
+    pub fn max_size(mut self, size: usize) -> Builder {
         self.max_size = Some(size);
         self
     }
@@ -953,20 +967,24 @@ impl Builder {
     ///
     /// # Panics
     ///
-    /// Building might panic if the `max_size` is 0 or lower than `core_size`:
+    /// Building might panic if the `max_size` is 0 or lower than `core_size` or exceeds half
+    /// the size of usize. This restriction exists because two counters (total workers and
+    /// idle counters) are stored within one AtomicUsize.
     pub fn build(self) -> ThreadPool {
+        use std::cmp::{max, min};
+
         let core_size = self.core_size.unwrap_or_else(|| {
-            let num_cpus = num_cpus::get() as u32;
+            let num_cpus = num_cpus::get();
             if let Some(max_size) = self.max_size {
-                std::cmp::min(num_cpus, max_size)
+                min(MAX_SIZE, min(num_cpus, max_size))
             } else {
-                num_cpus
+                min(MAX_SIZE, num_cpus)
             }
         });
-        // handle potential u32 overflow: try using twice the core_size or return core_size
+        // handle potential overflow: try using twice the core_size or return core_size
         let max_size = self
             .max_size
-            .unwrap_or_else(|| std::cmp::max(core_size, core_size * 2));
+            .unwrap_or_else(|| min(MAX_SIZE, max(core_size, core_size * 2)));
         let keep_alive = self.keep_alive.unwrap_or_else(|| Duration::from_secs(60));
 
         if let Some(name) = self.name {
@@ -1119,53 +1137,55 @@ impl Drop for Sentinel<'_> {
     }
 }
 
-const WORKER_IDLE_MASK: u64 = 0x0000_0000_FFFF_FFFF;
+const WORKER_IDLE_MASK: usize = MAX_SIZE;
+const INCREMENT_TOTAL: usize = 1 << (BITS / 2);
+const INCREMENT_IDLE: usize = 1;
 
-/// Struct that stores and handles an `AtomicU64` that stores the total worker count
-/// in the higher 32 bits and the idle worker count in the lower 32 bits.
+/// Struct that stores and handles an `AtomicUsize` that stores the total worker count
+/// in the higher half of bits and the idle worker count in the lower half of bits.
 /// This allows to to increment / decrement both counters in a single atomic operation.
 #[derive(Default)]
 struct WorkerCountData {
-    worker_count: AtomicU64,
+    worker_count: AtomicUsize,
 }
 
 impl WorkerCountData {
-    fn get_total_worker_count(&self) -> u32 {
+    fn get_total_worker_count(&self) -> usize {
         let curr_val = self.worker_count.load(Ordering::Relaxed);
         WorkerCountData::get_total_count(curr_val)
     }
 
-    fn get_idle_worker_count(&self) -> u32 {
+    fn get_idle_worker_count(&self) -> usize {
         let curr_val = self.worker_count.load(Ordering::Relaxed);
         WorkerCountData::get_idle_count(curr_val)
     }
 
-    fn get_both(&self) -> (u32, u32) {
+    fn get_both(&self) -> (usize, usize) {
         let curr_val = self.worker_count.load(Ordering::Relaxed);
         WorkerCountData::split(curr_val)
     }
 
     // keep for testing and completion's sake
     #[allow(dead_code)]
-    fn increment_both(&self) -> (u32, u32) {
+    fn increment_both(&self) -> (usize, usize) {
         let old_val = self
             .worker_count
-            .fetch_add(0x0000_0001_0000_0001, Ordering::Relaxed);
+            .fetch_add(INCREMENT_TOTAL + INCREMENT_IDLE, Ordering::Relaxed);
         WorkerCountData::split(old_val)
     }
 
-    fn decrement_both(&self) -> (u32, u32) {
+    fn decrement_both(&self) -> (usize, usize) {
         let old_val = self
             .worker_count
-            .fetch_sub(0x0000_0001_0000_0001, Ordering::Relaxed);
+            .fetch_sub(INCREMENT_TOTAL + INCREMENT_IDLE, Ordering::Relaxed);
         WorkerCountData::split(old_val)
     }
 
-    fn try_increment_worker_total(&self, mut expected: u64, max_total: u32) -> u64 {
+    fn try_increment_worker_total(&self, mut expected: usize, max_total: usize) -> usize {
         loop {
             match self.worker_count.compare_exchange_weak(
                 expected,
-                expected + 0x0000_0001_0000_0000,
+                expected + INCREMENT_TOTAL,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
@@ -1180,88 +1200,87 @@ impl WorkerCountData {
 
     // keep for testing and completion's sake
     #[allow(dead_code)]
-    fn increment_worker_total(&self) -> u32 {
+    fn increment_worker_total(&self) -> usize {
         let old_val = self
             .worker_count
-            .fetch_add(0x0000_0001_0000_0000, Ordering::Relaxed);
+            .fetch_add(INCREMENT_TOTAL, Ordering::Relaxed);
         WorkerCountData::get_total_count(old_val)
     }
 
     // keep for testing and completion's sake
     #[allow(dead_code)]
-    fn increment_worker_total_ret_both(&self) -> (u32, u32) {
+    fn increment_worker_total_ret_both(&self) -> (usize, usize) {
         let old_val = self
             .worker_count
-            .fetch_add(0x0000_0001_0000_0000, Ordering::Relaxed);
+            .fetch_add(INCREMENT_TOTAL, Ordering::Relaxed);
         WorkerCountData::split(old_val)
     }
 
     // keep for testing and completion's sake
     #[allow(dead_code)]
-    fn decrement_worker_total(&self) -> u32 {
+    fn decrement_worker_total(&self) -> usize {
         let old_val = self
             .worker_count
-            .fetch_sub(0x0000_0001_0000_0000, Ordering::Relaxed);
+            .fetch_sub(INCREMENT_TOTAL, Ordering::Relaxed);
         WorkerCountData::get_total_count(old_val)
     }
 
     // keep for testing and completion's sake
     #[allow(dead_code)]
-    fn decrement_worker_total_ret_both(&self) -> (u32, u32) {
+    fn decrement_worker_total_ret_both(&self) -> (usize, usize) {
         let old_val = self
             .worker_count
-            .fetch_sub(0x0000_0001_0000_0000, Ordering::Relaxed);
+            .fetch_sub(INCREMENT_TOTAL, Ordering::Relaxed);
         WorkerCountData::split(old_val)
     }
 
     // keep for testing and completion's sake
     #[allow(dead_code)]
-    fn increment_worker_idle(&self) -> u32 {
+    fn increment_worker_idle(&self) -> usize {
         let old_val = self
             .worker_count
-            .fetch_add(0x0000_0000_0000_0001, Ordering::Relaxed);
+            .fetch_add(INCREMENT_IDLE, Ordering::Relaxed);
         WorkerCountData::get_idle_count(old_val)
     }
 
-    fn increment_worker_idle_ret_both(&self) -> (u32, u32) {
+    fn increment_worker_idle_ret_both(&self) -> (usize, usize) {
         let old_val = self
             .worker_count
-            .fetch_add(0x0000_0000_0000_0001, Ordering::Relaxed);
+            .fetch_add(INCREMENT_IDLE, Ordering::Relaxed);
         WorkerCountData::split(old_val)
     }
 
-    fn decrement_worker_idle(&self) -> u32 {
+    fn decrement_worker_idle(&self) -> usize {
         let old_val = self
             .worker_count
-            .fetch_sub(0x0000_0000_0000_0001, Ordering::Relaxed);
+            .fetch_sub(INCREMENT_IDLE, Ordering::Relaxed);
         WorkerCountData::get_idle_count(old_val)
     }
 
     // keep for testing and completion's sake
     #[allow(dead_code)]
-    fn decrement_worker_idle_ret_both(&self) -> (u32, u32) {
+    fn decrement_worker_idle_ret_both(&self) -> (usize, usize) {
         let old_val = self
             .worker_count
-            .fetch_sub(0x0000_0000_0000_0001, Ordering::Relaxed);
+            .fetch_sub(INCREMENT_IDLE, Ordering::Relaxed);
         WorkerCountData::split(old_val)
     }
 
     #[inline]
-    fn split(val: u64) -> (u32, u32) {
-        let total_count = (val >> 32) as u32;
-        let idle_count = (val & WORKER_IDLE_MASK) as u32;
+    fn split(val: usize) -> (usize, usize) {
+        let total_count = val >> (BITS / 2);
+        let idle_count = val & WORKER_IDLE_MASK;
         (total_count, idle_count)
     }
 
     #[inline]
-    fn get_total_count(val: u64) -> u32 {
-        (val >> 32) as u32
+    fn get_total_count(val: usize) -> usize {
+        val >> (BITS / 2)
     }
 
     #[inline]
-    fn get_idle_count(val: u64) -> u32 {
-        // upper 32 bits are ommitted anyway
-        (val & WORKER_IDLE_MASK) as u32
+    fn get_idle_count(val: usize) -> usize {
+        val & WORKER_IDLE_MASK
     }
 }
 
@@ -1482,6 +1501,16 @@ mod tests {
     #[test]
     fn test_panic_on_smaller_max_than_core_pool_size() {
         ThreadPool::new(10, 4, Duration::from_secs(2));
+    }
+
+    #[should_panic(expected = "max_size may not be larger than half the size of usize")]
+    #[test]
+    fn test_panic_on_max_size_exceeds_half_usize() {
+        ThreadPool::new(
+            10,
+            1 << ((std::mem::size_of::<usize>() * 8) / 2),
+            Duration::from_secs(2),
+        );
     }
 
     #[test]
