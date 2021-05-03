@@ -376,7 +376,12 @@ impl ThreadPool {
         if max_size == 0 || max_size < core_size {
             panic!("max_size must be greater than 0 and greater or equal to the core pool size");
         } else if max_size > MAX_SIZE {
-            panic!("max_size may not be larger than half the size of usize");
+            panic!(
+                "max_size may not exceed {}, the maximum value that can be stored within half the bits of usize ({} -> {} bits in this case)",
+                MAX_SIZE,
+                BITS,
+                BITS / 2
+            );
         }
 
         let worker_data = WorkerData {
@@ -1503,7 +1508,7 @@ mod tests {
         ThreadPool::new(10, 4, Duration::from_secs(2));
     }
 
-    #[should_panic(expected = "max_size may not be larger than half the size of usize")]
+    #[should_panic(expected = "max_size may not exceed")]
     #[test]
     fn test_panic_on_max_size_exceeds_half_usize() {
         ThreadPool::new(
