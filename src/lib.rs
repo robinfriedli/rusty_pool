@@ -17,7 +17,9 @@ use std::thread;
 use std::time::Duration;
 
 const BITS: usize = std::mem::size_of::<usize>() * 8;
-const MAX_SIZE: usize = (1 << (BITS / 2)) - 1;
+/// The absolute maximum number of workers. This corresponds to the maximum value that can be stored within half the bits of usize,
+/// as two counters (total workers and idle workers) are stored in one AtomicUsize.
+pub const MAX_SIZE: usize = (1 << (BITS / 2)) - 1;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
