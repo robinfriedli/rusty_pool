@@ -1,3 +1,10 @@
+## [0.6.0] - 2021-05-02
+
+  * replace Atomic64 with AtomicUsize for worker count bookkeeping
+    * refactor worker count bookkeeping arithmetics to work based on the
+      size of usize on a given platform instead of requiring 64 bits
+    * enables using the crate on non 64 bit platforms
+
 ## [0.5.1] - 2021-02-27
 
   * Replace compare_and_swap with compare_exchange_weak.

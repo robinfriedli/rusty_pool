@@ -51,8 +51,8 @@ Locks are only used for the join functions to lock the `Condvar`, apart from tha
 this `ThreadPool` implementation fully relies on crossbeam and atomic operations.
 This `ThreadPool` decides whether it is currently idle (and should fast-return
 join attempts) by comparing the total worker count to the idle worker count, which
-are two `u32` values stored in one `AtomicU64` making sure that if both are updated
-they may be updated in a single atomic operation.
+are two values stored in one `AtomicUsize` (both half the size of usize) making sure
+that if both are updated they may be updated in a single atomic operation.
 
 The thread pool and its crossbeam channel can be destroyed by using the shutdown
 function, however that does not stop tasks that are already running but will
