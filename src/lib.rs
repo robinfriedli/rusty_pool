@@ -392,6 +392,7 @@ impl ThreadPool {
             worker_number: AtomicUsize::new(1),
             join_notify_condvar: Condvar::new(),
             join_notify_mutex: Mutex::new(()),
+            join_generation: AtomicUsize::new(0),
         };
 
         let channel_data = ChannelData { sender, receiver };
@@ -900,30 +901,42 @@ impl ThreadPool {
             return;
         }
 
+        let join_generation = current_worker_data.join_generation.load(Ordering::SeqCst);
         let guard = current_worker_data
             .join_notify_mutex
             .lock()
             .expect("could not get join notify mutex lock");
 
-        // recheck after acquiring lock
-        if ThreadPool::is_idle(current_worker_data, receiver) {
-            return;
-        }
-
         match time_out {
             Some(time_out) => {
-                let _ret_lock = current_worker_data
+                let _ret_guard = current_worker_data
                     .join_notify_condvar
-                    .wait_timeout(guard, time_out)
+                    .wait_timeout_while(guard, time_out, |_| {
+                        join_generation
+                            == current_worker_data.join_generation.load(Ordering::Relaxed)
+                            && !ThreadPool::is_idle(current_worker_data, receiver)
+                    })
                     .expect("could not wait for join condvar");
             }
             None => {
-                let _ret_lock = current_worker_data
+                let _ret_guard = current_worker_data
                     .join_notify_condvar
-                    .wait(guard)
+                    .wait_while(guard, |_| {
+                        join_generation
+                            == current_worker_data.join_generation.load(Ordering::Relaxed)
+                            && !ThreadPool::is_idle(current_worker_data, receiver)
+                    })
                     .expect("could not wait for join condvar");
             }
         };
+
+        // increment generation if current thread is first thread to be awakened from wait in current generation
+        let _ = current_worker_data.join_generation.compare_exchange(
+            join_generation,
+            join_generation.wrapping_add(1),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
 
     #[inline]
@@ -1331,6 +1344,7 @@ struct WorkerData {
     worker_number: AtomicUsize,
     join_notify_condvar: Condvar,
     join_notify_mutex: Mutex<()>,
+    join_generation: AtomicUsize,
 }
 
 struct ChannelData {
