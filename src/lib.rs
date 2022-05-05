@@ -899,7 +899,7 @@ impl ThreadPool {
         time_out: Option<Duration>,
     ) {
         // no thread is currently doing any work, return
-        if ThreadPool::is_idle(&current_worker_data, &receiver) {
+        if ThreadPool::is_idle(current_worker_data, receiver) {
             return;
         }
 
@@ -909,7 +909,7 @@ impl ThreadPool {
             .expect("could not get join notify mutex lock");
 
         // recheck after acquiring lock
-        if ThreadPool::is_idle(&current_worker_data, &receiver) {
+        if ThreadPool::is_idle(current_worker_data, receiver) {
             return;
         }
 
