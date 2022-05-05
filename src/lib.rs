@@ -837,6 +837,41 @@ impl ThreadPool {
         &self.worker_data.pool_name
     }
 
+    /// Starts all core workers by creating core idle workers until the total worker count reaches the core count.
+    /// 
+    /// Returns immediately if the current worker count is already >= core size.
+    pub fn start_core_threads(&self) {
+        let worker_count_data = &self.worker_data.worker_count_data;
+
+        let core_size = self.core_size;
+        let mut curr_worker_count = worker_count_data.worker_count.load(Ordering::Relaxed);
+        if WorkerCountData::get_total_count(curr_worker_count) >= core_size {
+            return;
+        }
+
+        loop {
+            let witnessed = worker_count_data.try_increment_worker_count(
+                curr_worker_count,
+                INCREMENT_TOTAL | INCREMENT_IDLE,
+                core_size,
+            );
+
+            if WorkerCountData::get_total_count(witnessed) >= core_size {
+                return;
+            }
+
+            let worker = Worker::new(
+                self.channel_data.receiver.clone(),
+                Arc::clone(&self.worker_data),
+                false,
+                None,
+            );
+
+            worker.start(None);
+            curr_worker_count = witnessed;
+        }
+    }
+
     #[inline]
     fn send_task_to_channel(&self, task: Job) -> Result<(), crossbeam_channel::SendError<Job>> {
         self.channel_data.sender.send(task)?;
@@ -1177,27 +1212,36 @@ impl WorkerCountData {
     fn increment_both(&self) -> (usize, usize) {
         let old_val = self
             .worker_count
-            .fetch_add(INCREMENT_TOTAL + INCREMENT_IDLE, Ordering::Relaxed);
+            .fetch_add(INCREMENT_TOTAL | INCREMENT_IDLE, Ordering::Relaxed);
         WorkerCountData::split(old_val)
     }
 
     fn decrement_both(&self) -> (usize, usize) {
         let old_val = self
             .worker_count
-            .fetch_sub(INCREMENT_TOTAL + INCREMENT_IDLE, Ordering::Relaxed);
+            .fetch_sub(INCREMENT_TOTAL | INCREMENT_IDLE, Ordering::Relaxed);
         WorkerCountData::split(old_val)
     }
 
-    fn try_increment_worker_total(&self, mut expected: usize, max_total: usize) -> usize {
+    fn try_increment_worker_total(&self, expected: usize, max_total: usize) -> usize {
+        self.try_increment_worker_count(expected, INCREMENT_TOTAL, max_total)
+    }
+
+    fn try_increment_worker_count(
+        &self,
+        mut expected: usize,
+        increment: usize,
+        max_total: usize,
+    ) -> usize {
         loop {
             match self.worker_count.compare_exchange_weak(
                 expected,
-                expected + INCREMENT_TOTAL,
+                expected + increment,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
                 Ok(witnessed) => return witnessed,
-                Err(witnessed) if WorkerCountData::get_total_count(witnessed) == max_total => {
+                Err(witnessed) if WorkerCountData::get_total_count(witnessed) >= max_total => {
                     return witnessed
                 }
                 Err(witnessed) => expected = witnessed,
@@ -2119,5 +2163,26 @@ mod tests {
         h3.join().unwrap();
 
         assert_eq!(count.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn test_start_core_threads() {
+        let pool = Builder::new().core_size(5).build();
+        pool.start_core_threads();
+        assert_eq!(pool.get_current_worker_count(), 5);
+        assert_eq!(pool.get_idle_worker_count(), 5);
+    }
+
+    #[test]
+    fn test_start_and_use_core_threads() {
+        let pool = Builder::new()
+            .core_size(5)
+            .max_size(10)
+            .keep_alive(Duration::from_secs(u64::MAX))
+            .build();
+        pool.start_core_threads();
+        let result = pool.evaluate(|| 5 + 5).await_complete();
+        assert_eq!(result, 10);
+        assert_eq!(pool.get_current_worker_count(), 5);
     }
 }
