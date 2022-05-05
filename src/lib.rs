@@ -693,7 +693,6 @@ impl ThreadPool {
                 let worker = Worker::new(
                     self.channel_data.receiver.clone(),
                     Arc::clone(&self.worker_data),
-                    false,
                     None,
                 );
 
@@ -718,7 +717,6 @@ impl ThreadPool {
                 let worker = Worker::new(
                     self.channel_data.receiver.clone(),
                     Arc::clone(&self.worker_data),
-                    true,
                     Some(self.keep_alive),
                 );
 
@@ -838,7 +836,7 @@ impl ThreadPool {
     }
 
     /// Starts all core workers by creating core idle workers until the total worker count reaches the core count.
-    /// 
+    ///
     /// Returns immediately if the current worker count is already >= core size.
     pub fn start_core_threads(&self) {
         let worker_count_data = &self.worker_data.worker_count_data;
@@ -863,7 +861,6 @@ impl ThreadPool {
             let worker = Worker::new(
                 self.channel_data.receiver.clone(),
                 Arc::clone(&self.worker_data),
-                false,
                 None,
             );
 
@@ -1041,7 +1038,6 @@ impl Builder {
 struct Worker {
     receiver: crossbeam_channel::Receiver<Job>,
     worker_data: Arc<WorkerData>,
-    can_timeout: bool,
     keep_alive: Option<Duration>,
 }
 
@@ -1049,13 +1045,11 @@ impl Worker {
     fn new(
         receiver: crossbeam_channel::Receiver<Job>,
         worker_data: Arc<WorkerData>,
-        can_timeout: bool,
         keep_alive: Option<Duration>,
     ) -> Self {
         Worker {
             receiver,
             worker_data,
-            can_timeout,
             keep_alive,
         }
     }
@@ -1080,14 +1074,9 @@ impl Worker {
 
                 loop {
                     // the two functions return different error types, but since the error type doesn't matter it is mapped to unit to make them compatible
-                    let received_task: Result<Job, _> = if self.can_timeout {
-                        self.receiver
-                            .recv_timeout(self.keep_alive.expect(
-                                "keep_alive duration is NONE despite can_timeout being true",
-                            ))
-                            .map_err(|_| ())
-                    } else {
-                        self.receiver.recv().map_err(|_| ())
+                    let received_task: Result<Job, _> = match self.keep_alive {
+                        Some(keep_alive) => self.receiver.recv_timeout(keep_alive).map_err(|_| ()),
+                        None => self.receiver.recv().map_err(|_| ()),
                     };
 
                     match received_task {
