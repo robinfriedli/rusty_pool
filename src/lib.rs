@@ -63,7 +63,7 @@ where
 /// using a oneshot channel blocking the thread when [`try_await_complete()`](struct.JoinHandle.html#method.try_await_complete) is called until a message, i.e. the result of the
 /// task, is received.
 pub struct JoinHandle<T: Send> {
-    receiver: oneshot::Receiver<T>,
+    pub receiver: oneshot::Receiver<T>,
 }
 
 impl<T: Send> JoinHandle<T> {
