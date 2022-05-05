@@ -1,6 +1,6 @@
 [package]
 name = "rusty_pool"
-version = "0.6.0"
+version = "0.7.0"
 authors = ["robinfriedli <robinfriedli@icloud.com>"]
 edition = "2018"
 license = "Apache-2.0"

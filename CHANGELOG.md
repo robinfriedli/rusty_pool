@@ -1,3 +1,25 @@
+## [0.7.0] - 2022-05-05
+
+  * improve joining
+    * use wait_while and wait_timeout_while to protect against spurious
+      wakeups
+    * add join_generation field to WorkerData to make sure all threads
+      waiting for a join leave at once by having the first awakened thread
+      increment the counter
+      * otherwise the pool might become non-idle again before all notified
+        threads were awakened, causing them to keep waiting
+  * implement ThreadPool::start_core_threads
+    * starts all core workers by creating core idle workers until the total
+      worker count reaches the core count
+    * implement WorkerCountData::try_increment_worker_count as an
+      alternative to try_increment_worker_total allowing to specify a
+      custom increment
+    * replace INCREMENT_TOTAL + INCREMENT_IDLE with
+      INCREMENT_TOTAL | INCREMENT_IDLE as a bitwise or is enough to combine
+      the increments as they have no overlapping bit and addition is not
+      required
+  * make field JoinHandle.receiver public
+
 ## [0.6.0] - 2021-05-02
 
   * replace Atomic64 with AtomicUsize for worker count bookkeeping
