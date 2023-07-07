@@ -315,6 +315,8 @@ pub struct ThreadPool {
     keep_alive: Duration,
     channel_data: Arc<ChannelData>,
     worker_data: Arc<WorkerData>,
+    on_worker_start: Option<WorkerCallback>,
+    on_worker_stop: Option<WorkerCallback>,
 }
 
 impl ThreadPool {
@@ -403,6 +405,8 @@ impl ThreadPool {
             keep_alive,
             channel_data: Arc::new(channel_data),
             worker_data: Arc::new(worker_data),
+            on_worker_start: None,
+            on_worker_stop: None,
         }
     }
 
@@ -695,6 +699,8 @@ impl ThreadPool {
                     self.channel_data.receiver.clone(),
                     Arc::clone(&self.worker_data),
                     None,
+                    self.on_worker_start.clone(),
+                    self.on_worker_stop.clone(),
                 );
 
                 worker.start(Some(task));
@@ -719,6 +725,8 @@ impl ThreadPool {
                     self.channel_data.receiver.clone(),
                     Arc::clone(&self.worker_data),
                     Some(self.keep_alive),
+                    self.on_worker_start.clone(),
+                    self.on_worker_stop.clone(),
                 );
 
                 worker.start(Some(task));
@@ -727,6 +735,22 @@ impl ThreadPool {
         }
 
         self.send_task_to_channel(task)
+    }
+
+    /// When a worker thread starts this callback function will be invoked
+    /// exactly once before it starts processing any jobs
+    pub fn on_worker_start<F>(&mut self, callback: F)
+    where F: Fn() + Send + Sync + 'static
+    {
+        self.on_worker_start.replace(Arc::new(callback));
+    }
+
+    /// When a worker thread stops this callback function will be invoked
+    /// exactly once before
+    pub fn on_worker_stop<F>(&mut self, callback: F)
+    where F: Fn() + Send + Sync + 'static
+    {
+        self.on_worker_stop.replace(Arc::new(callback));
     }
 
     /// Blocks the current thread until there aren't any non-idle threads anymore.
@@ -863,6 +887,8 @@ impl ThreadPool {
                 self.channel_data.receiver.clone(),
                 Arc::clone(&self.worker_data),
                 None,
+                self.on_worker_start.clone(),
+                self.on_worker_stop.clone(),
             );
 
             worker.start(None);
@@ -971,6 +997,8 @@ pub struct Builder {
     core_size: Option<usize>,
     max_size: Option<usize>,
     keep_alive: Option<Duration>,
+    on_worker_start: Option<WorkerCallback>,
+    on_worker_stop: Option<WorkerCallback>,
 }
 
 impl Builder {
@@ -1011,6 +1039,24 @@ impl Builder {
         self
     }
 
+    /// When a worker thread starts this callback function will be invoked
+    /// exactly once before it starts processing any jobs
+    pub fn on_worker_start<F>(mut self, callback: F) -> Builder
+    where F: Fn() + Send + Sync + 'static
+    {
+        self.on_worker_start.replace(Arc::new(callback));
+        self
+    }
+
+    /// When a worker thread stops this callback function will be invoked
+    /// exactly once before
+    pub fn on_worker_stop<F>(mut self, callback: F) -> Builder
+    where F: Fn() + Send + Sync + 'static
+    {
+        self.on_worker_stop.replace(Arc::new(callback));
+        self
+    }
+
     /// Build the `ThreadPool` using the parameters previously supplied to this `Builder` using the number of CPUs as
     /// default core size if none provided, twice the core size as max size if none provided, 60 seconds keep_alive
     /// if none provided and the default naming (rusty_pool_{pool_number}) if none provided.
@@ -1039,19 +1085,32 @@ impl Builder {
             .unwrap_or_else(|| min(MAX_SIZE, max(core_size, core_size * 2)));
         let keep_alive = self.keep_alive.unwrap_or_else(|| Duration::from_secs(60));
 
-        if let Some(name) = self.name {
+        let mut ret = if let Some(name) = self.name {
             ThreadPool::new_named(name, core_size, max_size, keep_alive)
         } else {
             ThreadPool::new(core_size, max_size, keep_alive)
+        };
+
+        if let Some(on_worker_start) = self.on_worker_start {
+            ret.on_worker_start(move || on_worker_start());
         }
+        if let Some(on_worker_stop) = self.on_worker_stop {
+            ret.on_worker_stop(move || on_worker_stop());
+        }
+
+        ret
     }
 }
+
+pub type WorkerCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 
 #[derive(Clone)]
 struct Worker {
     receiver: crossbeam_channel::Receiver<Job>,
     worker_data: Arc<WorkerData>,
     keep_alive: Option<Duration>,
+    on_start: Option<WorkerCallback>,
+    on_stop: Option<WorkerCallback>,
 }
 
 impl Worker {
@@ -1059,11 +1118,15 @@ impl Worker {
         receiver: crossbeam_channel::Receiver<Job>,
         worker_data: Arc<WorkerData>,
         keep_alive: Option<Duration>,
+        on_start: Option<WorkerCallback>,
+        on_stop: Option<WorkerCallback>,
     ) -> Self {
         Worker {
             receiver,
             worker_data,
             keep_alive,
+            on_start,
+            on_stop,
         }
     }
 
@@ -1080,6 +1143,10 @@ impl Worker {
             .name(worker_name)
             .spawn(move || {
                 let mut sentinel = Sentinel::new(&self);
+
+                if let Some(on_start) = self.on_start.clone() {
+                    on_start();
+                }
 
                 if let Some(task) = task {
                     self.exec_task_and_notify(&mut sentinel, task);
@@ -1104,6 +1171,10 @@ impl Worker {
                             break;
                         }
                     }
+                }
+
+                if let Some(on_stop) = self.on_stop.clone() {
+                    on_stop();
                 }
 
                 // can decrement both at once as the thread only gets here from an idle state
@@ -2187,5 +2258,33 @@ mod tests {
         let result = pool.evaluate(|| 5 + 5).await_complete();
         assert_eq!(result, 10);
         assert_eq!(pool.get_current_worker_count(), 5);
+    }
+
+    #[test]
+    fn test_on_callbacks() {
+        let mut pool = ThreadPool::new(1, 50, Duration::from_secs(0));
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let clone = counter.clone();
+        pool.on_worker_start(move || {
+            clone.fetch_add(1, Ordering::SeqCst);
+        });
+        let clone = counter.clone();
+        pool.on_worker_stop(move || {
+            clone.fetch_sub(1, Ordering::SeqCst);
+        });
+
+        for _ in 0..160 {
+            let clone = counter.clone();
+            pool.execute(move || {
+                let val = clone.load(Ordering::SeqCst);
+                assert!(val > 0);
+            });
+        }
+        thread::sleep(Duration::from_secs(2));
+
+        // there should only be one core left hence the counter should equal one
+        // (this is both a positive and negative test)
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 }
