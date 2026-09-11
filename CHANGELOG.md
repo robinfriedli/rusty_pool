@@ -1,3 +1,10 @@
+## [1.0.0] - 2026-09-11
+
+  * implement worker start and stop lifecycle callbacks
+  * update dependencies
+  * upgrade to Rust edition 2024
+  * clean up code and clippy lints
+
 ## [0.7.0] - 2022-05-05
 
   * improve joining

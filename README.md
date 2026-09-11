@@ -67,13 +67,13 @@ Worker lifecycle callbacks may be configured using [`Builder::on_worker_start`] 
 To add rusty_pool to your project simply add the following Cargo dependency:
 ```toml
 [dependencies]
-rusty_pool = "0.7.0"
+rusty_pool = "1.0.0"
 ```
 
 Or to exclude the "async" feature:
 ```toml
 [dependencies.rusty_pool]
-version = "0.7.0"
+version = "1.0.0"
 default-features = false
 ```
 
