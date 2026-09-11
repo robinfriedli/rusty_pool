@@ -1200,8 +1200,7 @@ impl WorkerCountData {
         WorkerCountData::split(curr_val)
     }
 
-    // keep for testing and completion's sake
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn increment_both(&self) -> (usize, usize) {
         let old_val = self
             .worker_count
@@ -1242,8 +1241,7 @@ impl WorkerCountData {
         }
     }
 
-    // keep for testing and completion's sake
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn increment_worker_total(&self) -> usize {
         let old_val = self
             .worker_count
@@ -1251,17 +1249,7 @@ impl WorkerCountData {
         WorkerCountData::get_total_count(old_val)
     }
 
-    // keep for testing and completion's sake
-    #[allow(dead_code)]
-    fn increment_worker_total_ret_both(&self) -> (usize, usize) {
-        let old_val = self
-            .worker_count
-            .fetch_add(INCREMENT_TOTAL, Ordering::Relaxed);
-        WorkerCountData::split(old_val)
-    }
-
-    // keep for testing and completion's sake
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn decrement_worker_total(&self) -> usize {
         let old_val = self
             .worker_count
@@ -1269,17 +1257,7 @@ impl WorkerCountData {
         WorkerCountData::get_total_count(old_val)
     }
 
-    // keep for testing and completion's sake
-    #[allow(dead_code)]
-    fn decrement_worker_total_ret_both(&self) -> (usize, usize) {
-        let old_val = self
-            .worker_count
-            .fetch_sub(INCREMENT_TOTAL, Ordering::Relaxed);
-        WorkerCountData::split(old_val)
-    }
-
-    // keep for testing and completion's sake
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn increment_worker_idle(&self) -> usize {
         let old_val = self
             .worker_count
@@ -1299,15 +1277,6 @@ impl WorkerCountData {
             .worker_count
             .fetch_sub(INCREMENT_IDLE, Ordering::Relaxed);
         WorkerCountData::get_idle_count(old_val)
-    }
-
-    // keep for testing and completion's sake
-    #[allow(dead_code)]
-    fn decrement_worker_idle_ret_both(&self) -> (usize, usize) {
-        let old_val = self
-            .worker_count
-            .fetch_sub(INCREMENT_IDLE, Ordering::Relaxed);
-        WorkerCountData::split(old_val)
     }
 
     #[inline]
