@@ -22,6 +22,7 @@ const BITS: usize = std::mem::size_of::<usize>() * 8;
 pub const MAX_SIZE: usize = (1 << (BITS / 2)) - 1;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
+type WorkerCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 
 /// Trait to implement for all items that may be executed by the `ThreadPool`.
 pub trait Task<R: Send>: Send {
@@ -192,6 +193,9 @@ impl Task<()> for Arc<AsyncTask> {
 /// The channel is only destroyed once all clones of the `ThreadPool` have been
 /// shut down / dropped.
 ///
+/// Worker lifecycle callbacks may be configured using [`Builder::on_worker_start`] and
+/// [`Builder::on_worker_stop`] to execute custom logic whenever a worker thread starts or stops.
+///
 /// # Usage
 /// Create a new `ThreadPool`:
 /// ```rust
@@ -206,6 +210,11 @@ impl Task<()> for Arc<AsyncTask> {
 /// let pool3 = ThreadPool::new_named(String::from("my_pool"), 5, 50, Duration::from_secs(60));
 /// // using the Builder struct:
 /// let pool4 = Builder::new().core_size(5).max_size(50).build();
+/// // configure worker lifecycle callbacks:
+/// let pool5 = Builder::new()
+///     .on_worker_start(|| println!("worker started"))
+///     .on_worker_stop(|| println!("worker stopped"))
+///     .build();
 /// ```
 ///
 /// Submit a closure for execution in the `ThreadPool`:
@@ -329,12 +338,15 @@ impl ThreadPool {
     /// the size of usize. This restriction exists because two counters (total workers and
     /// idle counters) are stored within one AtomicUsize.
     pub fn new(core_size: usize, max_size: usize, keep_alive: Duration) -> Self {
+        ThreadPool::new_named(Self::get_default_name(), core_size, max_size, keep_alive)
+    }
+
+    fn get_default_name() -> String {
         static POOL_COUNTER: AtomicUsize = AtomicUsize::new(1);
-        let name = format!(
+        format!(
             "rusty_pool_{}",
             POOL_COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
-        ThreadPool::new_named(name, core_size, max_size, keep_alive)
+        )
     }
 
     /// Construct a new `ThreadPool` with the specified name, core pool size, max pool size
@@ -364,6 +376,17 @@ impl ThreadPool {
         max_size: usize,
         keep_alive: Duration,
     ) -> Self {
+        Self::new_inner(name, core_size, max_size, keep_alive, None, None)
+    }
+
+    fn new_inner(
+        name: String,
+        core_size: usize,
+        max_size: usize,
+        keep_alive: Duration,
+        on_worker_start: Option<WorkerCallback>,
+        on_worker_stop: Option<WorkerCallback>,
+    ) -> Self {
         let (sender, receiver) = crossbeam_channel::unbounded();
 
         if max_size == 0 || max_size < core_size {
@@ -384,6 +407,8 @@ impl ThreadPool {
             join_notify_condvar: Condvar::new(),
             join_notify_mutex: Mutex::new(()),
             join_generation: AtomicUsize::new(0),
+            on_worker_start,
+            on_worker_stop,
         };
 
         let channel_data = ChannelData { sender, receiver };
@@ -896,7 +921,7 @@ impl ThreadPool {
         let guard = current_worker_data
             .join_notify_mutex
             .lock()
-            .expect("could not get join notify mutex lock");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         match time_out {
             Some(time_out) => {
@@ -907,7 +932,7 @@ impl ThreadPool {
                             == current_worker_data.join_generation.load(Ordering::Relaxed)
                             && !ThreadPool::is_idle(current_worker_data, receiver)
                     })
-                    .expect("could not wait for join condvar");
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
             None => {
                 let _ret_guard = current_worker_data
@@ -917,7 +942,7 @@ impl ThreadPool {
                             == current_worker_data.join_generation.load(Ordering::Relaxed)
                             && !ThreadPool::is_idle(current_worker_data, receiver)
                     })
-                    .expect("could not wait for join condvar");
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
         };
 
@@ -962,6 +987,8 @@ pub struct Builder {
     core_size: Option<usize>,
     max_size: Option<usize>,
     keep_alive: Option<Duration>,
+    on_worker_start: Option<WorkerCallback>,
+    on_worker_stop: Option<WorkerCallback>,
 }
 
 impl Builder {
@@ -1002,11 +1029,32 @@ impl Builder {
         self
     }
 
+    /// Specify a callback that is executed when a new worker thread is spawned.
+    ///
+    /// The callback must not panic or the worker thread will terminate and not respawn.
+    pub fn on_worker_start<F>(mut self, callback: F) -> Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.on_worker_start = Some(Arc::new(callback));
+        self
+    }
+
+    /// Specify a callback that is executed when a worker thread exits (even on panic).
+    ///
+    /// A panic in this callback does not itself cause the worker to be respawned;
+    /// when invoked during panic unwinding, a callback panic is suppressed
+    pub fn on_worker_stop<F>(mut self, callback: F) -> Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.on_worker_stop = Some(Arc::new(callback));
+        self
+    }
+
     /// Build the `ThreadPool` using the parameters previously supplied to this `Builder` using the number of CPUs as
     /// default core size if none provided, twice the core size as max size if none provided, 60 seconds keep_alive
     /// if none provided and the default naming (rusty_pool_{pool_number}) if none provided.
-    /// This function calls [`ThreadPool::new`](struct.ThreadPool.html#method.new) or
-    /// [`ThreadPool::new_named`](struct.ThreadPool.html#method.new_named) depending on whether a name was provided.
     ///
     /// # Panics
     ///
@@ -1030,11 +1078,14 @@ impl Builder {
             .unwrap_or_else(|| min(MAX_SIZE, max(core_size, core_size * 2)));
         let keep_alive = self.keep_alive.unwrap_or_else(|| Duration::from_secs(60));
 
-        if let Some(name) = self.name {
-            ThreadPool::new_named(name, core_size, max_size, keep_alive)
-        } else {
-            ThreadPool::new(core_size, max_size, keep_alive)
-        }
+        ThreadPool::new_inner(
+            self.name.unwrap_or_else(ThreadPool::get_default_name),
+            core_size,
+            max_size,
+            keep_alive,
+            self.on_worker_start,
+            self.on_worker_stop,
+        )
     }
 }
 
@@ -1070,10 +1121,16 @@ impl Worker {
         thread::Builder::new()
             .name(worker_name)
             .spawn(move || {
-                let mut sentinel = Sentinel::new(&self);
+                let mut sentinel = Sentinel::new(&self, task.is_none());
+
+                if let Some(callback) = &self.worker_data.on_worker_start {
+                    callback();
+                }
 
                 if let Some(task) = task {
                     self.exec_task_and_notify(&mut sentinel, task);
+                } else {
+                    sentinel.worker_state = WorkerState::Idle;
                 }
 
                 loop {
@@ -1100,15 +1157,21 @@ impl Worker {
                 // can decrement both at once as the thread only gets here from an idle state
                 // (if waiting for work and receiving an error)
                 self.worker_data.worker_count_data.decrement_both();
+
+                sentinel.worker_state = WorkerState::Stopping;
+
+                if let Some(callback) = &self.worker_data.on_worker_stop {
+                    callback();
+                }
             })
             .expect("could not spawn thread");
     }
 
     #[inline]
     fn exec_task_and_notify(&self, sentinel: &mut Sentinel, task: Job) {
-        sentinel.is_working = true;
+        sentinel.worker_state = WorkerState::Working;
         task();
-        sentinel.is_working = false;
+        sentinel.worker_state = WorkerState::Idle;
         // can already mark as idle as this thread will continue the work loop
         self.mark_idle_and_notify_joiners_if_no_work();
     }
@@ -1123,13 +1186,18 @@ impl Worker {
         // i.e. if incrementing the idle count leads to the idle count
         // being equal to the total worker count, notify joiners
         if old_total_count == old_idle_count + 1 && self.receiver.is_empty() {
-            let _lock = self
-                .worker_data
-                .join_notify_mutex
-                .lock()
-                .expect("could not get join notify mutex lock");
-            self.worker_data.join_notify_condvar.notify_all();
+            self.notify_joiners();
         }
+    }
+
+    #[inline]
+    fn notify_joiners(&self) {
+        let _lock = self
+            .worker_data
+            .join_notify_mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.worker_data.join_notify_condvar.notify_all();
     }
 }
 
@@ -1142,14 +1210,26 @@ impl Worker {
 /// panicked while executing a submitted task) then clone the worker and start it with an initial
 /// task of `None`.
 struct Sentinel<'s> {
-    is_working: bool,
+    worker_state: WorkerState,
     worker_ref: &'s Worker,
 }
 
+enum WorkerState {
+    StartingIdle,
+    StartingWorking,
+    Idle,
+    Working,
+    Stopping,
+}
+
 impl Sentinel<'_> {
-    fn new(worker_ref: &Worker) -> Sentinel<'_> {
+    fn new(worker_ref: &Worker, starts_idle: bool) -> Sentinel<'_> {
         Sentinel {
-            is_working: false,
+            worker_state: if starts_idle {
+                WorkerState::StartingIdle
+            } else {
+                WorkerState::StartingWorking
+            },
             worker_ref,
         }
     }
@@ -1157,17 +1237,52 @@ impl Sentinel<'_> {
 
 impl Drop for Sentinel<'_> {
     fn drop(&mut self) {
-        if thread::panicking() {
-            if self.is_working {
+        if !thread::panicking() {
+            return;
+        }
+
+        fn safe_call_stop_callback(callback: &Option<WorkerCallback>) {
+            if let Some(callback) = callback {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    callback();
+                }));
+            }
+        }
+
+        match self.worker_state {
+            WorkerState::StartingIdle => {
+                self.worker_ref
+                    .worker_data
+                    .worker_count_data
+                    .decrement_both();
+            }
+            WorkerState::StartingWorking => {
+                let (old_total, old_idle) = self
+                    .worker_ref
+                    .worker_data
+                    .worker_count_data
+                    .decrement_worker_total_ret_both();
+
+                if old_total == old_idle + 1 && self.worker_ref.receiver.is_empty() {
+                    self.worker_ref.notify_joiners();
+                }
+            }
+            WorkerState::Idle => {
+                safe_call_stop_callback(&self.worker_ref.worker_data.on_worker_stop);
+                self.worker_ref.clone().start(None);
+            }
+            WorkerState::Working => {
                 // worker thread panicked in the process of executing a submitted task,
                 // run the same logic as if the task completed normally and mark it as
                 // idle, since a clone of this worker will start the work loop as idle
                 // thread
                 self.worker_ref.mark_idle_and_notify_joiners_if_no_work();
+                safe_call_stop_callback(&self.worker_ref.worker_data.on_worker_stop);
+                self.worker_ref.clone().start(None);
             }
-
-            let worker = self.worker_ref.clone();
-            worker.start(None);
+            WorkerState::Stopping => {
+                // worker was already exiting and panicked on exit callback, continue
+            }
         }
     }
 }
@@ -1257,6 +1372,13 @@ impl WorkerCountData {
         WorkerCountData::get_total_count(old_val)
     }
 
+    fn decrement_worker_total_ret_both(&self) -> (usize, usize) {
+        let old_val = self
+            .worker_count
+            .fetch_sub(INCREMENT_TOTAL, Ordering::Relaxed);
+        WorkerCountData::split(old_val)
+    }
+
     #[cfg(test)]
     fn increment_worker_idle(&self) -> usize {
         let old_val = self
@@ -1305,6 +1427,8 @@ struct WorkerData {
     join_notify_condvar: Condvar,
     join_notify_mutex: Mutex<()>,
     join_generation: AtomicUsize,
+    on_worker_start: Option<WorkerCallback>,
+    on_worker_stop: Option<WorkerCallback>,
 }
 
 struct ChannelData {
@@ -1318,6 +1442,7 @@ mod tests {
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     };
     use std::thread;
     use std::time::Duration;
@@ -2158,5 +2283,168 @@ mod tests {
 
         assert_send_sync::<ThreadPool>();
         assert_send::<JoinHandle<()>>();
+    }
+
+    #[test]
+    fn test_worker_start_stop_callbacks() {
+        let (start_sender, start_receiver) = mpsc::channel();
+        let (stop_sender, stop_receiver) = mpsc::channel();
+
+        let pool = Builder::new()
+            .core_size(3)
+            .max_size(3)
+            .on_worker_start(move || {
+                start_sender.send(()).unwrap();
+            })
+            .on_worker_stop(move || {
+                stop_sender.send(()).unwrap();
+            })
+            .build();
+
+        pool.start_core_threads();
+
+        for _ in 0..3 {
+            start_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("worker start callback was not invoked");
+        }
+
+        pool.shutdown();
+
+        for _ in 0..3 {
+            stop_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("worker stop callback was not invoked");
+        }
+    }
+
+    #[test]
+    fn test_worker_start_callback_panic() {
+        let start_count = Arc::new(AtomicUsize::new(0));
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        let task_count = Arc::new(AtomicUsize::new(0));
+
+        let start_count_clone = start_count.clone();
+        let stop_count_clone = stop_count.clone();
+
+        let pool = Builder::new()
+            .core_size(1)
+            .max_size(1)
+            .on_worker_start(move || {
+                start_count_clone.fetch_add(1, Ordering::Relaxed);
+                panic!("expected start callback panic");
+            })
+            .on_worker_stop(move || {
+                stop_count_clone.fetch_add(1, Ordering::Relaxed);
+            })
+            .build();
+
+        let task_count_clone = task_count.clone();
+        pool.execute(move || {
+            task_count_clone.fetch_add(1, Ordering::Relaxed);
+        });
+
+        // Also verifies that a start callback panic correctly wakes joiners after
+        // removing the worker from the worker count.
+        pool.join();
+
+        assert_eq!(start_count.load(Ordering::Relaxed), 1);
+        assert_eq!(stop_count.load(Ordering::Relaxed), 0);
+        assert_eq!(task_count.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.get_current_worker_count(), 0);
+        assert_eq!(pool.get_idle_worker_count(), 0);
+    }
+
+    #[test]
+    fn test_worker_callbacks_on_task_panic() {
+        let (start_sender, start_receiver) = mpsc::channel();
+        let (stop_sender, stop_receiver) = mpsc::channel();
+
+        let pool = Builder::new()
+            .core_size(1)
+            .max_size(1)
+            .on_worker_start(move || {
+                start_sender.send(()).unwrap();
+            })
+            .on_worker_stop(move || {
+                stop_sender.send(()).unwrap();
+            })
+            .build();
+
+        pool.execute(|| {
+            panic!("expected task panic");
+        });
+
+        // Original worker starts.
+        start_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("initial worker was not started");
+
+        // Panicking worker invokes its stop callback.
+        stop_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("panicking worker did not invoke stop callback");
+
+        // Sentinel replaces it and the replacement invokes the start callback.
+        start_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("panicking worker was not replaced");
+
+        assert_eq!(pool.get_current_worker_count(), 1);
+        assert_eq!(pool.get_idle_worker_count(), 1);
+
+        pool.shutdown();
+
+        // Replacement exits normally.
+        stop_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("replacement worker did not invoke stop callback");
+    }
+
+    #[test]
+    fn test_worker_stop_callback_panic_during_task_panic() {
+        let start_count = Arc::new(AtomicUsize::new(0));
+        let stop_count = Arc::new(AtomicUsize::new(0));
+
+        let start_count_clone = start_count.clone();
+        let stop_count_clone = stop_count.clone();
+
+        let pool = Builder::new()
+            .core_size(1)
+            .max_size(1)
+            .on_worker_start(move || {
+                start_count_clone.fetch_add(1, Ordering::Relaxed);
+            })
+            .on_worker_stop(move || {
+                let previous = stop_count_clone.fetch_add(1, Ordering::Relaxed);
+
+                if previous == 0 {
+                    panic!("expected stop callback panic");
+                }
+            })
+            .build();
+
+        pool.execute(|| {
+            panic!("expected task panic");
+        });
+
+        pool.join();
+
+        // Wait for the replacement worker to actually execute its start callback.
+        let timeout = std::time::Instant::now() + Duration::from_secs(1);
+        while start_count.load(Ordering::Relaxed) < 2 {
+            assert!(
+                std::time::Instant::now() < timeout,
+                "replacement worker was not started"
+            );
+            thread::yield_now();
+        }
+
+        assert_eq!(start_count.load(Ordering::Relaxed), 2);
+        assert_eq!(stop_count.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.get_current_worker_count(), 1);
+        assert_eq!(pool.get_idle_worker_count(), 1);
+
+        pool.shutdown();
     }
 }

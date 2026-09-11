@@ -59,6 +59,9 @@ terminate the thread the next time it will try to fetch work from the channel.
 The channel is only destroyed once all clones of the `ThreadPool` have been
 shut down / dropped.
 
+Worker lifecycle callbacks may be configured using [`Builder::on_worker_start`] and
+[`Builder::on_worker_stop`] to execute custom logic whenever a worker thread starts or stops.
+
 # Installation
 
 To add rusty_pool to your project simply add the following Cargo dependency:
