@@ -1701,6 +1701,7 @@ mod tests {
         pool.shutdown_join();
     }
 
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn worker_count_test() {
         let worker_count_data = WorkerCountData::default();
@@ -1780,6 +1781,7 @@ mod tests {
         assert_eq!(worker_count_data.get_idle_worker_count(), 13465);
     }
 
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn test_try_increment_worker_total() {
         let worker_count_data = WorkerCountData::default();
