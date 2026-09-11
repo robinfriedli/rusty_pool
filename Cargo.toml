@@ -2,7 +2,7 @@
 name = "rusty_pool"
 version = "0.7.0"
 authors = ["robinfriedli <robinfriedli@icloud.com>"]
-edition = "2018"
+edition = "2024"
 license = "Apache-2.0"
 description = "Self growing / shrinking `ThreadPool` implementation based on crossbeam's multi-producer multi-consumer channels that enables awaiting the result of a task and offers async support"
 repository = "https://github.com/robinfriedli/rusty_pool"
