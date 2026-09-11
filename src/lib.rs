@@ -1,15 +1,15 @@
 #[cfg(feature = "async")]
 use futures::{
     future::BoxFuture,
-    task::{waker_ref, ArcWake},
+    task::{ArcWake, waker_ref},
 };
 use futures_channel::oneshot;
 use futures_executor::block_on;
 use std::future::Future;
 use std::option::Option;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc, Condvar, Mutex,
+    atomic::{AtomicUsize, Ordering},
 };
 #[cfg(feature = "async")]
 use std::task::Context;
@@ -1244,7 +1244,7 @@ impl WorkerCountData {
             ) {
                 Ok(witnessed) => return witnessed,
                 Err(witnessed) if WorkerCountData::get_total_count(witnessed) >= max_total => {
-                    return witnessed
+                    return witnessed;
                 }
                 Err(witnessed) => expected = witnessed,
             }
@@ -1356,8 +1356,8 @@ struct ChannelData {
 mod tests {
 
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use std::thread;
     use std::time::Duration;
