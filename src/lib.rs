@@ -132,15 +132,6 @@ impl Task<()> for Arc<AsyncTask> {
     }
 }
 
-// assert that Send is implemented
-trait ThreadSafe: Send {}
-
-impl<R: Send> ThreadSafe for dyn Task<R> {}
-
-impl<R: Send> ThreadSafe for JoinHandle<R> {}
-
-impl ThreadSafe for ThreadPool {}
-
 /// Self growing / shrinking `ThreadPool` implementation based on crossbeam's
 /// multi-producer multi-consumer channels that enables awaiting the result of a
 /// task and offers async support.
@@ -1362,9 +1353,9 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use super::Builder;
     use super::ThreadPool;
     use super::WorkerCountData;
+    use super::{Builder, JoinHandle};
 
     #[test]
     fn it_works() {
@@ -2187,5 +2178,14 @@ mod tests {
         let result = pool.evaluate(|| 5 + 5).await_complete();
         assert_eq!(result, 10);
         assert_eq!(pool.get_current_worker_count(), 5);
+    }
+
+    #[test]
+    fn types_are_thread_safe() {
+        fn assert_send<T: Send>() {}
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<ThreadPool>();
+        assert_send::<JoinHandle<()>>();
     }
 }
