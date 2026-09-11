@@ -16,11 +16,11 @@ default = ["async"]
 async = ["futures"]
 
 [dependencies]
-crossbeam-channel = "0.5.4"
-futures-channel = "0.3.21"
-futures-executor = "0.3.21"
-num_cpus = "1.13.1"
+crossbeam-channel = "0.5.17"
+futures-channel = "0.3.34"
+futures-executor = "0.3.34"
+num_cpus = "1.17.0"
 
 [dependencies.futures]
-version = "0.3.21"
+version = "0.3.34"
 optional = true
