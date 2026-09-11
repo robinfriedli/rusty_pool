@@ -116,7 +116,7 @@ impl Task<()> for Arc<AsyncTask> {
         let mut future_slot = self.future.lock().expect("failed to acquire mutex");
         if let Some(mut future) = future_slot.take() {
             let waker = waker_ref(&self);
-            let context = &mut Context::from_waker(&*waker);
+            let context = &mut Context::from_waker(&waker);
             if future.as_mut().poll(context).is_pending() {
                 *future_slot = Some(future);
             }
@@ -2014,7 +2014,7 @@ mod tests {
                 panic!("expected panic")
             }
 
-            return x;
+            x
         });
 
         handle.await_complete();
