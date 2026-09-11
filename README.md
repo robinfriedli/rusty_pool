@@ -1,8 +1,7 @@
 # rusty_pool
 
-Self growing / shrinking `ThreadPool` implementation based on crossbeam's
-multi-producer multi-consumer channels that enables awaiting the result of a
-task and offers async support.
+Self-growing and shrinking Thread Pool implementation based on crossbeam's multi-producer, multi-consumer channels.
+Provides non-blocking task execution, awaitable task results, and async support.
 
 This `ThreadPool` has two different pool sizes; a core pool size filled with
 threads that live for as long as the channel and a max pool size which describes
